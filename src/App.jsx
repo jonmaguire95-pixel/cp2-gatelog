@@ -27,7 +27,7 @@ function toDateStr(d) {
   );
 }
 
-// Round a Date to nearest 30-min using 15:30-min (930 sec) midpoint rule
+// Round a Date to nearest 30-min using 15:30 (930 sec) midpoint rule
 function rnd30(d) {
   if (!d) return null;
   const totalSec = d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds();
