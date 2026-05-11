@@ -275,7 +275,7 @@ function exportXLSX(results, shiftDate, reportDate, nqGates) {
     ["Report Date (date data was received)", reportDate, "Night shift OUTs allowed on this date AM only"],
     [],
     ["RULES", "Value", "Notes"],
-    ["Rounding Rule",    "15:30 min midpoint to nearest 30 min", ""],
+    ["Rounding Rule",    "15:30 midpoint to nearest 30 min", ""],
     ["Lunch Deduction",  "30 minutes", "Applied when both IN and OUT exist"],
     ["Badge IN Logic",   "First qualifying IN on shift date only", "Report date INs are excluded"],
     ["Badge OUT Logic",  "Last qualifying OUT per AM/PM rule", "AM IN: same date OUT | PM IN: same date or next AM"],
