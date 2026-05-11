@@ -27,12 +27,12 @@ function toDateStr(d) {
   );
 }
 
-// Round a Date to nearest 15-min using 7.5-min (450 sec) midpoint rule
-function rnd15(d) {
+// Round a Date to nearest 30-min using 15:30-min (930 sec) midpoint rule
+function rnd30(d) {
   if (!d) return null;
   const totalSec = d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds();
-  const rem = totalSec % 900;
-  let rounded = rem >= 450 ? totalSec + (900 - rem) : totalSec - rem;
+  const rem = totalSec % 1800;
+  let rounded = rem >= 930 ? totalSec + (1800 - rem) : totalSec - rem;
   rounded = rounded % 86400;
   const h = Math.floor(rounded / 3600);
   const m = Math.floor((rounded % 3600) / 60);
@@ -144,8 +144,8 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates) {
     const outRec = getValidOut(guid, rawIn);
     const rawOut = outRec ? outRec.ts : null;
 
-    const rndIn  = rnd15(rawIn);
-    const rndOut = rnd15(rawOut);
+    const rndIn  = rnd30(rawIn);
+    const rndOut = rnd30(rawOut);
 
     let rawHrs = null, lessLunch = null, billHrs = null;
     if (rndIn && rndOut) {
@@ -232,7 +232,7 @@ function exportXLSX(results, shiftDate, reportDate, nqGates) {
     [`Total Workers: ${results.length}`, "", "", `Clean: ${clean}`, "", "",
      `Missing OUT: ${mOut}`, "", "", `Missing IN: ${mIn}`, "", "",
      `Over 13 Hrs: ${over13}`, "", "", `Total Billable Hrs: ${decToHM(totalH)}`],
-    ["Rounding: Raw IN and Raw OUT each rounded independently to nearest 15 min via 7.5 min midpoint rule  |  " +
+    ["Rounding: Raw IN and Raw OUT each rounded independently to nearest 30 min via 15:30 midpoint rule  |  " +
      "Billable = (Rounded OUT minus Rounded IN) minus 30 min lunch  |  Times displayed as H:MM"],
     dataColHdrs,
     ...results.map(dataRows),
@@ -275,7 +275,7 @@ function exportXLSX(results, shiftDate, reportDate, nqGates) {
     ["Report Date (date data was received)", reportDate, "Night shift OUTs allowed on this date AM only"],
     [],
     ["RULES", "Value", "Notes"],
-    ["Rounding Rule",    "7.5 min midpoint to nearest 15 min", ""],
+    ["Rounding Rule",    "15:30 min midpoint to nearest 30 min", ""],
     ["Lunch Deduction",  "30 minutes", "Applied when both IN and OUT exist"],
     ["Badge IN Logic",   "First qualifying IN on shift date only", "Report date INs are excluded"],
     ["Badge OUT Logic",  "Last qualifying OUT per AM/PM rule", "AM IN: same date OUT | PM IN: same date or next AM"],
