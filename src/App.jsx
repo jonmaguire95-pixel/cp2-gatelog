@@ -354,7 +354,7 @@ function Badge({ status }) {
 const td = { padding:"10px 12px", color:"#c8d6e8", fontSize:13, verticalAlign:"middle" };
 
 // ── ROW — touch-safe expand ───────────────────────────────────────────────────
-function Row({ r, idx }) {
+function Row({ r, idx, showRoster }) {
   const [open, setOpen] = useState(false);
   const isIssue = r.status !== "Clean";
 
@@ -366,9 +366,14 @@ function Row({ r, idx }) {
     setOpen(o => !o);
   }, []);
 
-  const rowBg = isIssue
-    ? (idx % 2 === 0 ? "#1e0d0d" : "#180b0b")
-    : (idx % 2 === 0 ? "#0d1520" : "#0a1118");
+  // Highlight not-in-roster rows in amber-ish background
+  const rowBg = r.notInRoster
+    ? (idx % 2 === 0 ? "#1f1408" : "#1a1106")
+    : isIssue
+      ? (idx % 2 === 0 ? "#1e0d0d" : "#180b0b")
+      : (idx % 2 === 0 ? "#0d1520" : "#0a1118");
+
+  const colSpan = showRoster ? 10 : 7;
 
   return (
     <>
@@ -378,9 +383,22 @@ function Row({ r, idx }) {
         style={{ background:rowBg, cursor:"pointer", borderBottom:"1px solid #1a2535",
           WebkitTapHighlightColor:"transparent" }}
       >
-        <td style={td}>{r.name}</td>
+        <td style={td}>
+          {r.name}
+          {r.notInRoster && (
+            <span style={{
+              marginLeft:8, fontSize:9, padding:"2px 5px", borderRadius:3,
+              background:"#92400e", color:"#fff", letterSpacing:0.5,
+            }}>NOT IN ROSTER</span>
+          )}
+        </td>
         <td style={{...td, color:"#6b7a8d"}}>{r.company}</td>
         <td style={{...td, color:"#6b7a8d", fontFamily:"'DM Mono',monospace"}}>{r.ein}</td>
+        {showRoster && (<>
+          <td style={{...td, fontSize:12, color: r.supervisor === "N/A" ? "#4b5e7a" : "#c8d6e8"}}>{r.supervisor}</td>
+          <td style={{...td, fontSize:12, color: r.area === "N/A" ? "#4b5e7a" : "#c8d6e8"}}>{r.area}</td>
+          <td style={{...td, fontSize:12, color: r.scope === "N/A" ? "#4b5e7a" : "#c8d6e8"}}>{r.scope}</td>
+        </>)}
         <td style={{...td, fontFamily:"'DM Mono',monospace", fontSize:12}}>
           {toDateStr(r.rndIn)  || <span style={{color:"#ef4444"}}>MISSING</span>}
         </td>
@@ -396,7 +414,7 @@ function Row({ r, idx }) {
 
       {open && (
         <tr style={{ background:"#060d16", borderBottom:"1px solid #1a2535" }}>
-          <td colSpan={7} style={{ padding:"12px 14px" }}>
+          <td colSpan={colSpan} style={{ padding:"12px 14px" }}>
             <div style={{
               display:"grid",
               gridTemplateColumns:"repeat(auto-fill, minmax(200px, 1fr))",
@@ -414,6 +432,11 @@ function Row({ r, idx }) {
                 ["Billable Hrs",  decToHM(r.billHrs)],
                 ["NQ IN (ref)",   r.nqIn  ? `${toDateStr(r.nqIn.ts)} — ${r.nqIn.gate}`   : ""],
                 ["NQ OUT (ref)",  r.nqOut ? `${toDateStr(r.nqOut.ts)} — ${r.nqOut.gate}` : ""],
+                ...(showRoster ? [
+                  ["Supervisor",  r.supervisor],
+                  ["Area",        r.area],
+                  ["Scope",       r.scope],
+                ] : []),
               ].map(([k, v]) => (
                 <div key={k} style={{
                   background:"#0d1520", borderRadius:6, padding:"8px 10px",
@@ -456,6 +479,9 @@ export default function App() {
   const [reportDate, setReportDate] = useState("2026-05-07");
   const [filter, setFilter]         = useState("All");
   const [search, setSearch]         = useState("");
+  const [supFilter, setSupFilter]   = useState("");
+  const [areaFilter, setAreaFilter] = useState("");
+  const [scopeFilter, setScopeFilter] = useState("");
   const [nqText, setNqText]         = useState([...NQ_GATES_DEFAULT].sort().join("\n"));
   const [showConfig, setShowConfig] = useState(false);
   const [dragging, setDragging]     = useState(false);
@@ -463,6 +489,108 @@ export default function App() {
   const [error, setError]           = useState("");
   const [processing, setProcessing] = useState(false);
   const fileRef = useRef();
+
+  // ── Employee roster state ──
+  const [roster, setRoster]         = useState([]); // [{ein, firstName, lastName, supervisor, area, scope}]
+  const [rosterMeta, setRosterMeta] = useState(null); // {uploaded_at, uploaded_by, count}
+  const [rosterMsg, setRosterMsg]   = useState("");
+  const rosterFileRef = useRef();
+
+  // Load roster on mount
+  useEffect(() => {
+    if (!supabaseReady()) return;
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from("employees")
+          .select("*")
+          .order("last_name", { ascending: true });
+        if (!error && data) {
+          setRoster(data.map(r => ({
+            ein: String(r.ein || "").trim(),
+            firstName: r.first_name || "",
+            lastName: r.last_name || "",
+            supervisor: r.supervisor || "",
+            area: r.area || "",
+            scope: r.scope || "",
+          })));
+          if (data.length > 0) {
+            setRosterMeta({
+              count: data.length,
+              uploaded_at: data[0].uploaded_at,
+              uploaded_by: data[0].uploaded_by,
+            });
+          }
+        }
+      } catch (_) { /* silent */ }
+    })();
+  }, []);
+
+  // Roster upload handler (parses .xlsx, replaces in Supabase)
+  const handleRosterUpload = async (file) => {
+    if (!file) return;
+    setRosterMsg("");
+    if (!supabaseReady()) { setRosterMsg("Database not configured."); return; }
+    if (!uploadedBy.trim()) { setRosterMsg("Enter your name first."); return; }
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      if (!rows.length) throw new Error("Spreadsheet is empty.");
+
+      // Flexible column detection
+      const keyMap = {};
+      const first = rows[0];
+      for (const k of Object.keys(first)) {
+        const lower = k.toLowerCase().trim();
+        if (lower === "ein" || lower.includes("ein")) keyMap.ein = k;
+        else if (lower.includes("first")) keyMap.firstName = k;
+        else if (lower.includes("last")) keyMap.lastName = k;
+        else if (lower.includes("supervisor")) keyMap.supervisor = k;
+        else if (lower === "area" || lower.includes("area")) keyMap.area = k;
+        else if (lower === "scope" || lower.includes("scope")) keyMap.scope = k;
+      }
+      if (!keyMap.ein) throw new Error("No EIN column found in spreadsheet.");
+
+      const parsed = rows
+        .map(r => ({
+          ein: String(r[keyMap.ein] || "").trim(),
+          first_name: String(r[keyMap.firstName] || "").trim(),
+          last_name: String(r[keyMap.lastName] || "").trim(),
+          supervisor: String(r[keyMap.supervisor] || "").trim(),
+          area: String(r[keyMap.area] || "").trim(),
+          scope: String(r[keyMap.scope] || "").trim(),
+          uploaded_by: uploadedBy.trim(),
+          uploaded_at: new Date().toISOString(),
+        }))
+        .filter(r => r.ein);
+
+      if (!parsed.length) throw new Error("No valid rows with EIN found.");
+
+      // Replace strategy: delete all, insert new
+      const { error: delErr } = await supabase.from("employees").delete().neq("ein", "___never___");
+      if (delErr) throw delErr;
+      const { error: insErr } = await supabase.from("employees").insert(parsed);
+      if (insErr) throw insErr;
+
+      setRoster(parsed.map(r => ({
+        ein: r.ein, firstName: r.first_name, lastName: r.last_name,
+        supervisor: r.supervisor, area: r.area, scope: r.scope,
+      })));
+      setRosterMeta({ count: parsed.length, uploaded_at: parsed[0].uploaded_at, uploaded_by: parsed[0].uploaded_by });
+      setRosterMsg(`Uploaded ${parsed.length} employees.`);
+    } catch (e) {
+      setRosterMsg("Upload error: " + e.message);
+    }
+  };
+
+  // Compute absent employees: in roster but no badge event today
+  const absentEmployees = (() => {
+    if (!roster.length || !results.length) return [];
+    const badgedEINs = new Set(results.map(r => String(r.ein || "").trim()).filter(Boolean));
+    return roster.filter(emp => emp.ein && !badgedEINs.has(emp.ein));
+  })();
 
   const processFile = useCallback((file) => {
     if (!file) return;
@@ -505,17 +633,51 @@ export default function App() {
   const over13 = results.filter(r => r.over13).length;
   const totalH = results.reduce((s, r) => s + (r.billHrs || 0), 0);
 
-  const filtered = results.filter(r => {
+  // Roster lookup by EIN
+  const rosterByEIN = (() => {
+    const map = {};
+    for (const r of roster) {
+      if (r.ein) map[String(r.ein).trim()] = r;
+    }
+    return map;
+  })();
+
+  // Enrich each result row with supervisor / area / scope / notInRoster flag
+  const enriched = results.map(r => {
+    const ein = String(r.ein || "").trim();
+    const emp = ein ? rosterByEIN[ein] : null;
+    const notInRoster = roster.length > 0 && (!ein || !emp);
+    return {
+      ...r,
+      supervisor: emp && emp.supervisor ? emp.supervisor : (emp ? "N/A" : "N/A"),
+      area:       emp && emp.area       ? emp.area       : (emp ? "N/A" : "N/A"),
+      scope:      emp && emp.scope      ? emp.scope      : (emp ? "N/A" : "N/A"),
+      notInRoster,
+    };
+  });
+
+  // Filter dropdown values: build unique sorted lists from the enriched data
+  const supervisors = [...new Set(enriched.map(r => r.supervisor).filter(Boolean))].sort();
+  const areas       = [...new Set(enriched.map(r => r.area).filter(Boolean))].sort();
+  const scopes      = [...new Set(enriched.map(r => r.scope).filter(Boolean))].sort();
+
+  const notInRosterCount = enriched.filter(r => r.notInRoster).length;
+
+  const filtered = enriched.filter(r => {
     const mf =
-      filter === "All"         ? true :
-      filter === "Issues"      ? r.status !== "Clean" :
-      filter === "Missing OUT" ? r.status === "Missing OUT" :
-      filter === "Missing IN"  ? r.status === "Missing IN" :
-      filter === "Over 13"     ? r.over13 : true;
+      filter === "All"            ? true :
+      filter === "Issues"         ? r.status !== "Clean" :
+      filter === "Missing OUT"    ? r.status === "Missing OUT" :
+      filter === "Missing IN"     ? r.status === "Missing IN" :
+      filter === "Over 13"        ? r.over13 :
+      filter === "Not in Roster"  ? r.notInRoster : true;
     const ms = !search ||
       r.name.toLowerCase().includes(search.toLowerCase()) ||
       r.ein.includes(search);
-    return mf && ms;
+    const supOk = !supFilter   || r.supervisor === supFilter;
+    const areaOk = !areaFilter || r.area === areaFilter;
+    const scopeOk = !scopeFilter || r.scope === scopeFilter;
+    return mf && ms && supOk && areaOk && scopeOk;
   });
 
   const inp = {
@@ -694,6 +856,62 @@ export default function App() {
     );
   }
 
+  // ── Absent employees screen ──
+  if (screen === "absent") {
+    return (
+      <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
+        fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 }}>
+          <div>
+            <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>ABSENT EMPLOYEES</div>
+            <div style={{ fontSize:11, color:"#4b5e7a", marginTop:2 }}>
+              In roster but did not badge on {shiftDate} · {absentEmployees.length} of {roster.length} total
+            </div>
+          </div>
+          <button onClick={() => setScreen("results")} style={btn(false, "#334155")}>Back to Results</button>
+        </div>
+        <div style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden" }}>
+          {!roster.length ? (
+            <div style={{ padding:24, color:"#4b5e7a", fontSize:13 }}>
+              No employee roster uploaded yet. Open ⚙ Config to upload one.
+            </div>
+          ) : !absentEmployees.length ? (
+            <div style={{ padding:24, color:"#34d399", fontSize:13 }}>
+              ✓ All {roster.length} employees badged in today.
+            </div>
+          ) : (
+            <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", minWidth:680 }}>
+                <thead>
+                  <tr style={{ background:"#060d16", borderBottom:"2px solid #1a2535" }}>
+                    {["Name","EIN","Supervisor","Area","Scope"].map(h => (
+                      <th key={h} style={{ padding:"9px 12px", textAlign:"left", fontSize:10,
+                        color:"#4b5e7a", textTransform:"uppercase", letterSpacing:0.8, fontWeight:600 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {absentEmployees
+                    .slice()
+                    .sort((a, b) => (a.lastName + a.firstName).localeCompare(b.lastName + b.firstName))
+                    .map((e, i) => (
+                      <tr key={i} style={{ borderBottom:"1px solid #1a2535" }}>
+                        <td style={{ padding:"9px 12px", fontSize:12 }}>{e.lastName}, {e.firstName}</td>
+                        <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace" }}>{e.ein}</td>
+                        <td style={{ padding:"9px 12px", fontSize:12 }}>{e.supervisor}</td>
+                        <td style={{ padding:"9px 12px", fontSize:12 }}>{e.area}</td>
+                        <td style={{ padding:"9px 12px", fontSize:12 }}>{e.scope}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
       fontFamily:"'DM Sans','Segoe UI',sans-serif" }}>
@@ -725,6 +943,17 @@ export default function App() {
               ...btn(true, "#1d4ed8"), background:"#1d4ed8", color:"#fff",
             }}>↓ Excel</button>
             <button onClick={handleSave} style={btn(false, "#334155")} title="Save to history">💾 Save</button>
+            {roster.length > 0 && (
+              <button
+                onClick={() => setScreen("absent")}
+                style={{
+                  ...btn(false, "#334155"),
+                  color: absentEmployees.length > 0 ? "#f87171" : "#4b5e7a",
+                  borderColor: absentEmployees.length > 0 ? "#7f1d1d" : "#1a2d45",
+                }}
+                title="Show absent employees"
+              >🚫 Absent {absentEmployees.length > 0 ? `(${absentEmployees.length})` : ""}</button>
+            )}
             <button onClick={() => { setScreen("upload"); setResults([]); setFileName(""); }}
               style={btn(false, "#334155")}>↺</button>
           </>)}
@@ -768,6 +997,46 @@ export default function App() {
             </div>
             <textarea value={nqText} onChange={e => setNqText(e.target.value)}
               rows={7} style={{...inp, marginTop:3, resize:"vertical"}} />
+          </div>
+
+          {/* ── Employee Roster Upload ── */}
+          <div style={{ marginTop:14, paddingTop:14, borderTop:"1px solid #1a2535" }}>
+            <label style={{ fontSize:10, color:"#4b5e7a", textTransform:"uppercase", letterSpacing:1 }}>
+              MMR Employee Roster (.xlsx)
+            </label>
+            <div style={{ fontSize:10, color:"#4b5e7a", marginTop:2, marginBottom:6,
+              fontFamily:"'DM Mono',monospace" }}>
+              Columns: EIN, First Name, Last Name, Supervisor, Area, Scope. New upload replaces previous.
+            </div>
+            <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+              <input
+                ref={rosterFileRef}
+                type="file"
+                accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                onChange={e => handleRosterUpload(e.target.files[0])}
+                style={{ display:"none" }}
+              />
+              <button
+                onClick={() => rosterFileRef.current?.click()}
+                style={{
+                  background:"#1d4ed8", color:"#fff", border:"none",
+                  borderRadius:6, padding:"8px 14px", fontSize:12, fontWeight:600,
+                  cursor:"pointer", fontFamily:"'DM Mono',monospace",
+                }}
+              >📤 Upload Roster</button>
+              {rosterMeta && (
+                <div style={{ fontSize:11, color:"#4b5e7a", fontFamily:"'DM Mono',monospace" }}>
+                  {rosterMeta.count} employees · last by {rosterMeta.uploaded_by} · {new Date(rosterMeta.uploaded_at).toLocaleString()}
+                </div>
+              )}
+            </div>
+            {rosterMsg && (
+              <div style={{
+                marginTop:8, fontSize:12,
+                color: rosterMsg.startsWith("Upload error") || rosterMsg.startsWith("Enter") || rosterMsg.startsWith("Database") ? "#f87171" : "#34d399",
+                fontFamily:"'DM Mono',monospace",
+              }}>{rosterMsg}</div>
+            )}
           </div>
         </div>
       )}
@@ -886,7 +1155,65 @@ export default function App() {
             {["All","Issues","Missing OUT","Missing IN","Over 13"].map(f => (
               <button key={f} onClick={() => setFilter(f)} style={btn(filter===f,"#1d4ed8")}>{f}</button>
             ))}
+            {notInRosterCount > 0 && (
+              <button
+                onClick={() => setFilter(filter === "Not in Roster" ? "All" : "Not in Roster")}
+                style={{
+                  ...btn(filter === "Not in Roster", "#f59e0b"),
+                  color: filter === "Not in Roster" ? "#fff" : "#f59e0b",
+                  borderColor: "#92400e",
+                }}
+              >⚠ Not in Roster ({notInRosterCount})</button>
+            )}
           </div>
+
+          {/* Supervisor / Area / Scope filters — only show when roster loaded */}
+          {roster.length > 0 && (
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10, alignItems:"center" }}>
+              <select
+                value={supFilter}
+                onChange={e => setSupFilter(e.target.value)}
+                style={{
+                  background:"#0d1520", color:"#c8d6e8", border:"1px solid #1a2d45",
+                  borderRadius:6, padding:"6px 10px", fontSize:12,
+                  fontFamily:"'DM Mono',monospace", cursor:"pointer",
+                }}
+              >
+                <option value="">All Supervisors</option>
+                {supervisors.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+              <select
+                value={areaFilter}
+                onChange={e => setAreaFilter(e.target.value)}
+                style={{
+                  background:"#0d1520", color:"#c8d6e8", border:"1px solid #1a2d45",
+                  borderRadius:6, padding:"6px 10px", fontSize:12,
+                  fontFamily:"'DM Mono',monospace", cursor:"pointer",
+                }}
+              >
+                <option value="">All Areas</option>
+                {areas.map(a => <option key={a} value={a}>{a}</option>)}
+              </select>
+              <select
+                value={scopeFilter}
+                onChange={e => setScopeFilter(e.target.value)}
+                style={{
+                  background:"#0d1520", color:"#c8d6e8", border:"1px solid #1a2d45",
+                  borderRadius:6, padding:"6px 10px", fontSize:12,
+                  fontFamily:"'DM Mono',monospace", cursor:"pointer",
+                }}
+              >
+                <option value="">All Scopes</option>
+                {scopes.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+              {(supFilter || areaFilter || scopeFilter) && (
+                <button
+                  onClick={() => { setSupFilter(""); setAreaFilter(""); setScopeFilter(""); }}
+                  style={btn(false, "#334155")}
+                >Clear</button>
+              )}
+            </div>
+          )}
           <div style={{ marginBottom:10 }}>
             <input
               placeholder="Search name or EIN…"
@@ -910,7 +1237,11 @@ export default function App() {
               <table style={{ width:"100%", borderCollapse:"collapse", minWidth:680 }}>
                 <thead>
                   <tr style={{ background:"#060d16", borderBottom:"2px solid #1a2535" }}>
-                    {["Employee Name","Company","EIN","Rounded IN","Rounded OUT","Billable","Status"].map(h => (
+                    {[
+                      "Employee Name","Company","EIN",
+                      ...(roster.length > 0 ? ["Supervisor","Area","Scope"] : []),
+                      "Rounded IN","Rounded OUT","Billable","Status"
+                    ].map(h => (
                       <th key={h} style={{
                         padding:"9px 12px", textAlign:"left", fontSize:10,
                         color:"#4b5e7a", textTransform:"uppercase", letterSpacing:0.8,
@@ -920,9 +1251,9 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((r, i) => <Row key={r.guid} r={r} idx={i} />)}
+                  {filtered.map((r, i) => <Row key={r.guid} r={r} idx={i} showRoster={roster.length > 0} />)}
                   {!filtered.length && (
-                    <tr><td colSpan={7} style={{ padding:36, textAlign:"center", color:"#4b5e7a" }}>
+                    <tr><td colSpan={roster.length > 0 ? 10 : 7} style={{ padding:36, textAlign:"center", color:"#4b5e7a" }}>
                       No records match.
                     </td></tr>
                   )}
