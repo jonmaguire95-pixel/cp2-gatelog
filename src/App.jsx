@@ -173,7 +173,7 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates) {
       guid, name: emp.name, company: emp.company, ein: emp.ein,
       rawIn, rawOut, rndIn, rndOut,
       inGate:  inRec  ? inRec.gate  : "",
-      outGate: outRec ? outRec.gate : "",
+      outGate: outRec ? outRec.area : "",
       rawHrs, lessLunch, billHrs,
       nqIn:  nqInMap[guid]  || null,
       nqOut: nqOutMap[guid] || null,
