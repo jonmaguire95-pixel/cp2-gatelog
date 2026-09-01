@@ -28,18 +28,66 @@ function toDateStr(d) {
   );
 }
 
-// Round a Date to nearest 30-min using 15:30 (930 sec) midpoint rule
-function rnd30(d) {
+// ── ROUNDING RULES (configurable via Config panel, stored in database) ────────
+// Defaults preserve original behavior: nearest 30 min via 15:30 (930 sec) midpoint,
+// 30 min lunch deduction.
+const RULES_DEFAULT = { roundTo: 30, midpointSec: 930, lunchMin: 30 };
+
+function midpointToStr(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function rulesSummary(rules) {
+  return rules.roundTo > 0
+    ? `${midpointToStr(rules.midpointSec)} midpoint to nearest ${rules.roundTo} min`
+    : "No rounding (exact badge times)";
+}
+
+// Round a Date per the configured rule: nearest {roundTo} min, rounding up when the
+// remainder is at or past {midpointSec}. roundTo=0 disables rounding (seconds zeroed).
+function roundTime(d, rules) {
   if (!d) return null;
+  const r = new Date(d);
+  if (!rules || !rules.roundTo) { r.setSeconds(0, 0); return r; }
+  const interval = rules.roundTo * 60;
   const totalSec = d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds();
-  const rem = totalSec % 1800;
-  let rounded = rem >= 930 ? totalSec + (1800 - rem) : totalSec - rem;
+  const rem = totalSec % interval;
+  let rounded = rem >= rules.midpointSec ? totalSec + (interval - rem) : totalSec - rem;
   rounded = rounded % 86400;
   const h = Math.floor(rounded / 3600);
   const m = Math.floor((rounded % 3600) / 60);
-  const r = new Date(d);
   r.setHours(h, m, 0, 0);
   return r;
+}
+
+function toYMD(d) {
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+
+function addDays(d, n) {
+  const r = new Date(d);
+  r.setDate(r.getDate() + n);
+  return r;
+}
+
+// Detect the shift date of a raw CSV: the most common calendar date among
+// qualifying IN events (falls back to all events if none qualify).
+function detectShiftDate(rows, nqGates) {
+  const counts = {};
+  let best = null, bestN = 0;
+  const tally = (r) => {
+    const ts = parseDate(r["Event Timestamp"] || r["EventTimestamp"] || "");
+    if (!ts) return;
+    const d = toYMD(ts);
+    counts[d] = (counts[d] || 0) + 1;
+    if (counts[d] > bestN) { best = d; bestN = counts[d]; }
+  };
+  const qIns = rows.filter(r =>
+    (r["Access Point"] || "") === "In" && !nqGates.has(r["Area"] || ""));
+  (qIns.length ? qIns : rows).forEach(tally);
+  return best;
 }
 
 function decToHM(dec) {
@@ -78,7 +126,7 @@ function parseCSV(text) {
 }
 
 // ── MAIN ANALYSIS ─────────────────────────────────────────────────────────────
-function analyze(rows, shiftDateStr, reportDateStr, nqGates) {
+function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAULT) {
   const shiftDate  = new Date(shiftDateStr  + "T00:00:00");
   const reportDate = new Date(reportDateStr + "T00:00:00");
 
@@ -145,17 +193,17 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates) {
     const outRec = getValidOut(guid, rawIn);
     const rawOut = outRec ? outRec.ts : null;
 
-    const rndIn  = rnd30(rawIn);
-    const rndOut = rnd30(rawOut);
+    const rndIn  = roundTime(rawIn, rules);
+    const rndOut = roundTime(rawOut, rules);
 
     let rawHrs = null, lessLunch = null, billHrs = null;
     if (rndIn && rndOut) {
       const elapsedMin = (rndOut - rndIn) / 60000;
       if (elapsedMin > 0) {
-        const netMin  = Math.max(elapsedMin - 30, 0);
+        const netMin  = Math.max(elapsedMin - rules.lunchMin, 0);
         rawHrs    = +(elapsedMin / 60).toFixed(4);
         lessLunch = +(netMin / 60).toFixed(4);
-        billHrs   = lessLunch; // Billable = rndOut - rndIn - 30 min; no second rounding pass
+        billHrs   = lessLunch; // Billable = rndOut - rndIn - lunch; no second rounding pass
       }
     }
 
@@ -186,7 +234,32 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates) {
 }
 
 // ── EXCEL EXPORT — iOS-safe blob download ────────────────────────────────────
-function exportXLSX(results, shiftDate, reportDate, nqGates) {
+// XLSX.writeFile uses document.createElement('a').click() which iOS Safari blocks.
+// Instead: write to ArrayBuffer → Blob → object URL → anchor click.
+function downloadWorkbook(wb, fname) {
+  const wbOut = XLSX.write(wb, { bookType:"xlsx", type:"array" });
+  const blob  = new Blob([wbOut], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url   = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href     = url;
+  a.download = fname;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+// Adds the Excel header filter arrows to a sheet. Rows and columns are zero
+// indexed. The range runs from the header row through the last data row only,
+// so totals rows below the data stay out of the filter.
+function setAutoFilter(ws, headerRow, lastRow, lastCol) {
+  ws["!autofilter"] = { ref: XLSX.utils.encode_range({
+    s: { r: headerRow, c: 0 },
+    e: { r: Math.max(lastRow, headerRow), c: lastCol },
+  }) };
+}
+
+function exportXLSX(results, shiftDate, reportDate, nqGates, rules = RULES_DEFAULT) {
   const wb = XLSX.utils.book_new();
 
   function setColWidths(ws, widths) {
@@ -233,12 +306,15 @@ function exportXLSX(results, shiftDate, reportDate, nqGates) {
     [`Total Workers: ${results.length}`, "", "", `Clean: ${clean}`, "", "",
      `Missing OUT: ${mOut}`, "", "", `Missing IN: ${mIn}`, "", "",
      `Over 13 Hrs: ${over13}`, "", "", `Total Billable Hrs: ${decToHM(totalH)}`],
-    ["Rounding: Raw IN and Raw OUT each rounded independently to nearest 30 min via 15:30 midpoint rule  |  " +
-     "Billable = (Rounded OUT minus Rounded IN) minus 30 min lunch  |  Times displayed as H:MM"],
+    [(rules.roundTo > 0
+       ? `Rounding: Raw IN and Raw OUT each rounded independently to nearest ${rules.roundTo} min via ${midpointToStr(rules.midpointSec)} midpoint rule`
+       : "Rounding: none — exact badge times used") +
+     `  |  Billable = (Rounded OUT minus Rounded IN) minus ${rules.lunchMin} min lunch  |  Times displayed as H:MM`],
     dataColHdrs,
     ...results.map(dataRows),
   ]);
   setColWidths(btWs, [28,10,10,22,26,22,22,26,22,16,16,16,22,26,22,26,18]);
+  setAutoFilter(btWs, 3, 3 + results.length, dataColHdrs.length - 1);
   XLSX.utils.book_append_sheet(wb, btWs, "BILLABLE TIME");
 
   // ─── TAB 3: ISSUES
@@ -250,6 +326,7 @@ function exportXLSX(results, shiftDate, reportDate, nqGates) {
     ...issues.map(dataRows),
   ]);
   setColWidths(issWs, [28,10,10,22,26,22,22,26,22,16,16,16,22,26,22,26,18]);
+  setAutoFilter(issWs, 1, 1 + issues.length, dataColHdrs.length - 1);
   XLSX.utils.book_append_sheet(wb, issWs, "ISSUES");
 
   // ─── TAB 4: SUMMARY
@@ -266,6 +343,7 @@ function exportXLSX(results, shiftDate, reportDate, nqGates) {
     ["Avg Billable Hrs per Worker",   withHrs > 0 ? decToHM(totalH / withHrs) : ""],
   ]);
   setColWidths(sumWs, [34, 14]);
+  setAutoFilter(sumWs, 1, 9, 1);
   XLSX.utils.book_append_sheet(wb, sumWs, "SUMMARY");
 
   // ─── TAB 5: CONFIG
@@ -276,8 +354,8 @@ function exportXLSX(results, shiftDate, reportDate, nqGates) {
     ["Report Date (date data was received)", reportDate, "Night shift OUTs allowed on this date AM only"],
     [],
     ["RULES", "Value", "Notes"],
-    ["Rounding Rule",    "15:30 midpoint to nearest 30 min", ""],
-    ["Lunch Deduction",  "30 minutes", "Applied when both IN and OUT exist"],
+    ["Rounding Rule",    rulesSummary(rules), "Editable in the app Config panel"],
+    ["Lunch Deduction",  `${rules.lunchMin} minutes`, "Applied when both IN and OUT exist"],
     ["Badge IN Logic",   "First qualifying IN on shift date only", "Report date INs are excluded"],
     ["Badge OUT Logic",  "Last qualifying OUT per AM/PM rule", "AM IN: same date OUT | PM IN: same date or next AM"],
     ["NQ Gate Rule",     "Off-site swipes shown as reference only", "Not used in calculations"],
@@ -287,30 +365,76 @@ function exportXLSX(results, shiftDate, reportDate, nqGates) {
     ["Gate Name (exact match)"],
     ...[...nqGates].sort().map(g => [g]),
     [],
-    ["NOTE: S-Curve Turnstile 2 is NOT in the NQ list. Monitor and add above if needed."],
+    ...(nqGates.has("S-Curve Turnstile 2") ? [] :
+      [["NOTE: S-Curve Turnstile 2 is NOT in the NQ list. Monitor and add via Config if needed."]]),
   ]);
   setColWidths(cfgWs, [46, 36, 52]);
   XLSX.utils.book_append_sheet(wb, cfgWs, "CONFIG");
 
-  // ─── iOS-safe download ───────────────────────────────────────────────────
-  // XLSX.writeFile uses document.createElement('a').click() which iOS Safari blocks.
-  // Instead: write to ArrayBuffer → Blob → object URL → anchor click.
-  // If the anchor click is suppressed (iOS), fall back to window.open on the blob URL.
-  const wbOut  = XLSX.write(wb, { bookType:"xlsx", type:"array" });
-  const blob   = new Blob([wbOut], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-  const url    = URL.createObjectURL(blob);
-  const fname  = `CP2_GateLog_${shiftDate}.xlsx`;
+  downloadWorkbook(wb, `CP2_GateLog_${shiftDate}.xlsx`);
+}
 
-  const a = document.createElement("a");
-  a.href     = url;
-  a.download = fname;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+// ── WEEKLY ROLLUP EXPORT ──────────────────────────────────────────────────────
+// rollup: { emps: [{name, company, ein, days:{date:{billHrs,status}}, daysWorked, issueDays, total}], dates: [..] }
+// dayMeta: [{shift_date, total_workers, clean_count, missing_out, missing_in, missing_both, over_13, total_bill_hrs}]
+function exportWeeklyXLSX(rollup, dayMeta, rules = RULES_DEFAULT) {
+  const wb = XLSX.utils.book_new();
+  const { emps, dates } = rollup;
+  const first = dates[0], last = dates[dates.length - 1];
+  const fmtD = d => `${d.slice(5,7)}/${d.slice(8,10)}`;
 
-  // iOS Safari fallback: if the anchor download attribute is ignored, open in new tab
-  // so the user can long-press → Save to Files
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  function setColWidths(ws, widths) {
+    ws["!cols"] = widths.map(w => ({ wch: w }));
+  }
+
+  // ─── TAB 1: WEEKLY ROLLUP
+  const grandTotal = emps.reduce((s, e) => s + e.total, 0);
+  const hdrs = ["Employee Name","Company","EIN", ...dates.map(fmtD), "Days Worked","Issue Days","Total Hrs (H:MM)"];
+  const empRow = e => [
+    e.name, e.company, e.ein,
+    ...dates.map(d => {
+      const day = e.days[d];
+      if (!day) return "";
+      if (day.billHrs != null) return decToHM(day.billHrs);
+      return "MISS";
+    }),
+    e.daysWorked, e.issueDays, decToHM(e.total),
+  ];
+  const dayTotals = dates.map(d =>
+    decToHM(emps.reduce((s, e) => s + ((e.days[d] && e.days[d].billHrs) || 0), 0)));
+
+  const wkWs = XLSX.utils.aoa_to_sheet([
+    [`CP2 LNG  |  MMR Gate Log Weekly Rollup  |  ${first} to ${last}  |  ${dates.length} day(s)  |  ${emps.length} employees`],
+    [(rules.roundTo > 0
+       ? `Rounding: nearest ${rules.roundTo} min via ${midpointToStr(rules.midpointSec)} midpoint`
+       : "Rounding: none") +
+     `  |  Lunch: ${rules.lunchMin} min  |  MISS = badge record incomplete that day (0 hrs counted)  |  Times as H:MM`],
+    hdrs,
+    ...emps.map(empRow),
+    [],
+    ["DAILY TOTALS","","", ...dayTotals, "", "", decToHM(grandTotal)],
+  ]);
+  setColWidths(wkWs, [28,10,10, ...dates.map(() => 9), 12, 11, 15]);
+  setAutoFilter(wkWs, 2, 2 + emps.length, hdrs.length - 1);
+  XLSX.utils.book_append_sheet(wb, wkWs, "WEEKLY ROLLUP");
+
+  // ─── TAB 2: DAILY SUMMARY
+  const dsWs = XLSX.utils.aoa_to_sheet([
+    [`DAILY SUMMARY  |  ${first} to ${last}`],
+    ["Shift Date","Workers","Clean","Missing OUT","Missing IN","Missing Both","Over 13 Hrs","Total Billable Hrs"],
+    ...dayMeta.map(d => [
+      d.shift_date, d.total_workers, d.clean_count, d.missing_out, d.missing_in,
+      d.missing_both, d.over_13, decToHM(Number(d.total_bill_hrs) || 0),
+    ]),
+    [],
+    ["TOTAL", "", "", "", "", "", "",
+     decToHM(dayMeta.reduce((s, d) => s + (Number(d.total_bill_hrs) || 0), 0))],
+  ]);
+  setColWidths(dsWs, [12,10,10,12,12,13,12,18]);
+  setAutoFilter(dsWs, 1, 1 + dayMeta.length, 7);
+  XLSX.utils.book_append_sheet(wb, dsWs, "DAILY SUMMARY");
+
+  downloadWorkbook(wb, `CP2_GateLog_Weekly_${first}_to_${last}.xlsx`);
 }
 
 // ── STATUS CONFIG ─────────────────────────────────────────────────────────────
@@ -475,14 +599,27 @@ export default function App() {
 
   const [screen, setScreen]         = useState("upload");
   const [results, setResults]       = useState([]);
-  const [shiftDate, setShiftDate]   = useState("2026-05-06");
-  const [reportDate, setReportDate] = useState("2026-05-07");
+  // Default to yesterday's shift, today's report — the normal morning workflow
+  const [shiftDate, setShiftDate]   = useState(() => toYMD(addDays(new Date(), -1)));
+  const [reportDate, setReportDate] = useState(() => toYMD(new Date()));
   const [filter, setFilter]         = useState("All");
   const [search, setSearch]         = useState("");
   const [supFilter, setSupFilter]   = useState("");
   const [areaFilter, setAreaFilter] = useState("");
   const [scopeFilter, setScopeFilter] = useState("");
   const [nqText, setNqText]         = useState([...NQ_GATES_DEFAULT].sort().join("\n"));
+  // Every gate name this device has seen, from uploads, saved reports, or the
+  // shared config. Feeds the gate checklist in the Config panel.
+  const [seenGates, setSeenGates]   = useState(() => {
+    try {
+      const cached = JSON.parse(localStorage.getItem("cp2-config") || "null");
+      return cached && Array.isArray(cached.knownGates) ? cached.knownGates : [];
+    } catch (_) { return []; }
+  });
+  const [newGate, setNewGate]       = useState("");
+  const [rules, setRules]           = useState(RULES_DEFAULT);
+  const [cfgMeta, setCfgMeta]       = useState(null); // {updated_by, updated_at} from database
+  const [cfgMsg, setCfgMsg]         = useState("");
   const [showConfig, setShowConfig] = useState(false);
   const [dragging, setDragging]     = useState(false);
   const [fileName, setFileName]     = useState("");
@@ -490,11 +627,47 @@ export default function App() {
   const [processing, setProcessing] = useState(false);
   const fileRef = useRef();
 
+  // ── Bulk upload state ──
+  const [bulkFiles, setBulkFiles]   = useState([]); // [{name, rows, shiftDate, reportDate, status}]
+  const [bulkBusy, setBulkBusy]     = useState(false);
+  const [knownDates, setKnownDates] = useState(new Set()); // shift_dates already saved in DB
+
+  // ── Weekly rollup state ──
+  const [weeklyReports, setWeeklyReports] = useState([]); // report metadata rows
+  const [selIds, setSelIds]         = useState(new Set());
+  const [rollup, setRollup]         = useState(null); // {emps, dates}
+  const [rollupMeta, setRollupMeta] = useState([]);   // day meta for selected reports
+  const [weeklyMsg, setWeeklyMsg]   = useState("");
+  const [weeklySearch, setWeeklySearch] = useState("");
+  const [weeklyBusy, setWeeklyBusy] = useState(false);
+
   // ── Employee roster state ──
   const [roster, setRoster]         = useState([]); // [{ein, firstName, lastName, supervisor, area, scope}]
   const [rosterMeta, setRosterMeta] = useState(null); // {uploaded_at, uploaded_by, count}
   const [rosterMsg, setRosterMsg]   = useState("");
   const rosterFileRef = useRef();
+
+  // Fold new gate names into the seen list, keeping it sorted and deduped
+  const mergeSeenGates = useCallback((names) => {
+    setSeenGates(prev => {
+      const merged = new Set(prev);
+      let changed = false;
+      for (const n of names || []) {
+        const t = String(n || "").trim();
+        if (t && !merged.has(t)) { merged.add(t); changed = true; }
+      }
+      return changed ? [...merged].sort() : prev;
+    });
+  }, []);
+
+  // Keep the seen gate list cached on this device
+  useEffect(() => {
+    try {
+      const cached = JSON.parse(localStorage.getItem("cp2-config") || "null") || {};
+      cached.knownGates = seenGates;
+      localStorage.setItem("cp2-config", JSON.stringify(cached));
+    } catch (_) { /* ignore */ }
+  }, [seenGates]);
 
   // Load roster on mount
   useEffect(() => {
@@ -525,6 +698,88 @@ export default function App() {
       } catch (_) { /* silent */ }
     })();
   }, []);
+
+  // Load shared config (NQ gates + rounding rules) on mount.
+  // Database is the source of truth for the team; localStorage is a fallback cache.
+  useEffect(() => {
+    try {
+      const cached = JSON.parse(localStorage.getItem("cp2-config") || "null");
+      if (cached) {
+        if (Array.isArray(cached.nqGates)) setNqText(cached.nqGates.join("\n"));
+        if (cached.rules) setRules({ ...RULES_DEFAULT, ...cached.rules });
+      }
+    } catch (_) { /* ignore bad cache */ }
+    if (!supabaseReady()) return;
+    (async () => {
+      try {
+        const { data, error } = await supabase.from("app_config").select("*");
+        if (error || !data) return;
+        const byKey = {};
+        data.forEach(r => { byKey[r.key] = r; });
+        let latest = null;
+        if (byKey.nq_gates && Array.isArray(byKey.nq_gates.value)) {
+          setNqText(byKey.nq_gates.value.join("\n"));
+          latest = byKey.nq_gates;
+        }
+        if (byKey.rules && byKey.rules.value) {
+          setRules({ ...RULES_DEFAULT, ...byKey.rules.value });
+          if (!latest || byKey.rules.updated_at > latest.updated_at) latest = byKey.rules;
+        }
+        if (byKey.known_gates && Array.isArray(byKey.known_gates.value)) {
+          mergeSeenGates(byKey.known_gates.value);
+        }
+        if (latest) setCfgMeta({ updated_by: latest.updated_by, updated_at: latest.updated_at });
+        localStorage.setItem("cp2-config", JSON.stringify({
+          nqGates: byKey.nq_gates ? byKey.nq_gates.value : null,
+          rules: byKey.rules ? byKey.rules.value : null,
+          knownGates: byKey.known_gates && Array.isArray(byKey.known_gates.value)
+            ? byKey.known_gates.value : seenGates,
+        }));
+      } catch (_) { /* silent — defaults still apply */ }
+    })();
+  }, []);
+
+  // Save shared config for the whole team
+  const handleSaveConfig = async () => {
+    setCfgMsg("");
+    const gates = nqText.split("\n").map(s => s.trim()).filter(Boolean);
+    const cleanRules = {
+      roundTo: Math.max(0, Number(rules.roundTo) || 0),
+      midpointSec: Math.max(0, Number(rules.midpointSec) || 0),
+      lunchMin: Math.max(0, Number(rules.lunchMin) || 0),
+    };
+    // The shared seen gate list keeps the checklist consistent for the whole team
+    const knownUnion = [...new Set([...seenGates, ...gates])].sort();
+    setSeenGates(knownUnion);
+    localStorage.setItem("cp2-config", JSON.stringify({ nqGates: gates, rules: cleanRules, knownGates: knownUnion }));
+    if (!supabaseReady()) { setCfgMsg("Saved on this device only — database not configured."); return; }
+    try {
+      const by = uploadedBy.trim() || "unknown";
+      const now = new Date().toISOString();
+      const { error } = await supabase.from("app_config").upsert([
+        { key: "nq_gates",    value: gates,      updated_by: by, updated_at: now },
+        { key: "rules",       value: cleanRules, updated_by: by, updated_at: now },
+        { key: "known_gates", value: knownUnion, updated_by: by, updated_at: now },
+      ]);
+      if (error) throw error;
+      setCfgMeta({ updated_by: by, updated_at: now });
+      setCfgMsg("Config saved — applies for everyone.");
+    } catch (e) {
+      setCfgMsg("Config save error: " + e.message);
+    }
+  };
+
+  // Add a gate by name. It lands in the checklist already checked (off site),
+  // since that is the only reason to add one by hand. Uncheck to keep it qualifying.
+  const addGate = () => {
+    const t = newGate.trim();
+    if (!t) return;
+    mergeSeenGates([t]);
+    const next = currentGates();
+    next.add(t);
+    setNqText([...next].sort().join("\n"));
+    setNewGate("");
+  };
 
   // Roster upload handler (parses .xlsx, replaces in Supabase)
   const handleRosterUpload = async (file) => {
@@ -592,6 +847,8 @@ export default function App() {
     return roster.filter(emp => emp.ein && !badgedEINs.has(emp.ein));
   })();
 
+  const currentGates = () => new Set(nqText.split("\n").map(s => s.trim()).filter(Boolean));
+
   const processFile = useCallback((file) => {
     if (!file) return;
     setFileName(file.name);
@@ -602,8 +859,9 @@ export default function App() {
       try {
         const rows = parseCSV(e.target.result);
         if (!rows.length) throw new Error("No data rows found in CSV.");
-        const nqGates = new Set(nqText.split("\n").map(s => s.trim()).filter(Boolean));
-        setResults(analyze(rows, shiftDate, reportDate, nqGates));
+        mergeSeenGates(rows.map(r => r["Area"]));
+        const nqGates = currentGates();
+        setResults(analyze(rows, shiftDate, reportDate, nqGates, rules));
         setScreen("results");
       } catch(err) {
         setError("Error: " + err.message);
@@ -612,17 +870,50 @@ export default function App() {
       }
     };
     reader.readAsText(file);
-  }, [shiftDate, reportDate, nqText]);
+  }, [shiftDate, reportDate, nqText, rules, mergeSeenGates]);
+
+  // Multiple files → bulk screen: each file parsed, shift date auto-detected,
+  // then every day is saved to the database in one pass.
+  const prepareBulk = useCallback((files) => {
+    setError("");
+    setProcessing(true);
+    const nqGates = currentGates();
+    Promise.all([...files].map(f =>
+      f.text().then(text => {
+        const rows = parseCSV(text);
+        if (!rows.length) return { name: f.name, rows: [], shiftDate: "", reportDate: "", status: "No data rows" };
+        mergeSeenGates(rows.map(r => r["Area"]));
+        const sd = detectShiftDate(rows, nqGates) || toYMD(addDays(new Date(), -1));
+        return { name: f.name, rows, shiftDate: sd, reportDate: toYMD(addDays(new Date(sd + "T00:00:00"), 1)), status: "" };
+      }).catch(err => ({ name: f.name, rows: [], shiftDate: "", reportDate: "", status: "Read error: " + err.message }))
+    )).then(parsed => {
+      parsed.sort((a, b) => a.shiftDate.localeCompare(b.shiftDate));
+      setBulkFiles(parsed);
+      setScreen("bulk");
+      setProcessing(false);
+    });
+    // Load shift dates already in the database so duplicates get flagged
+    if (supabaseReady()) {
+      supabase.from("reports").select("shift_date").then(({ data }) => {
+        if (data) setKnownDates(new Set(data.map(r => r.shift_date)));
+      });
+    }
+  }, [nqText, mergeSeenGates]);
+
+  const handleFiles = useCallback((fileList) => {
+    const files = [...(fileList || [])].filter(f => f && f.name.toLowerCase().endsWith(".csv"));
+    if (!files.length) return;
+    if (files.length === 1) processFile(files[0]);
+    else prepareBulk(files);
+  }, [processFile, prepareBulk]);
 
   const onDrop = useCallback(e => {
     e.preventDefault(); setDragging(false);
-    const file = e.dataTransfer.files[0];
-    if (file) processFile(file);
-  }, [processFile]);
+    handleFiles(e.dataTransfer.files);
+  }, [handleFiles]);
 
   const handleExport = () => {
-    const nqGates = new Set(nqText.split("\n").map(s => s.trim()).filter(Boolean));
-    exportXLSX(results, shiftDate, reportDate, nqGates);
+    exportXLSX(results, shiftDate, reportDate, currentGates(), rules);
   };
 
   // Derived stats
@@ -698,37 +989,72 @@ export default function App() {
   });
 
   // ── Supabase save / load handlers ──
+  // Writes the columns that actually exist in the reports table
+  // (the old build wrote shifts_count/issues_count, which don't — every save failed).
+  const saveReport = async (res, sDate, rDate, fname) => {
+    const totalBillHrs = res.reduce((s, r) => s + (r.billHrs || 0), 0);
+    const { error } = await supabase.from("reports").insert({
+      shift_date: sDate,
+      report_date: rDate,
+      uploaded_by: uploadedBy.trim(),
+      file_name: fname || null,
+      results_json: { results: res, shiftDate: sDate, reportDate: rDate },
+      raw_csv_path: null,
+      total_workers: res.length,
+      clean_count:  res.filter(r => r.status === "Clean").length,
+      missing_out:  res.filter(r => r.status === "Missing OUT").length,
+      missing_in:   res.filter(r => r.status === "Missing IN").length,
+      missing_both: res.filter(r => r.status === "Missing IN & OUT").length,
+      over_13:      res.filter(r => r.over13).length,
+      total_bill_hrs: Math.round(totalBillHrs * 100) / 100,
+    });
+    if (error) throw error;
+  };
+
   const handleSave = async () => {
     setSaveMsg("");
     if (!uploadedBy.trim()) { setSaveMsg("Enter your name first."); return; }
     if (!supabaseReady()) { setSaveMsg("Database not configured."); return; }
     if (!results.length) { setSaveMsg("Nothing to save."); return; }
     try {
-      const totalBillHrs = results.reduce((s, r) => s + (r.billHrs || 0), 0);
-      const issuesCount = results.filter(r => r.status !== "Clean").length;
-      const { error } = await supabase.from("reports").insert({
-        shift_date: shiftDate,
-        report_date: reportDate,
-        uploaded_by: uploadedBy.trim(),
-        results_json: { results, shiftDate, reportDate },
-        raw_csv_path: null,
-        shifts_count: results.length,
-        issues_count: issuesCount,
-        total_bill_hrs: Math.round(totalBillHrs * 100) / 100
-      });
-      if (error) throw error;
+      await saveReport(results, shiftDate, reportDate, fileName);
       setSaveMsg("Saved.");
     } catch (e) {
       setSaveMsg("Save error: " + e.message);
     }
   };
 
+  // Process every prepared bulk file: analyze with current gates/rules, save each day
+  const runBulk = async () => {
+    if (!uploadedBy.trim()) { setBulkFiles(f => f.map(x => x.status ? x : { ...x, status: "Enter your name first." })); return; }
+    if (!supabaseReady()) { setBulkFiles(f => f.map(x => x.status ? x : { ...x, status: "Database not configured." })); return; }
+    setBulkBusy(true);
+    const nqGates = currentGates();
+    const out = [];
+    for (const f of bulkFiles) {
+      if (!f.rows.length || !f.shiftDate) { out.push(f); continue; }
+      try {
+        const res = analyze(f.rows, f.shiftDate, f.reportDate, nqGates, rules);
+        await saveReport(res, f.shiftDate, f.reportDate, f.name);
+        out.push({ ...f, status: `Saved — ${res.length} workers, ${decToHM(res.reduce((s, r) => s + (r.billHrs || 0), 0))} hrs` });
+      } catch (e) {
+        out.push({ ...f, status: "Save error: " + e.message });
+      }
+      setBulkFiles([...out, ...bulkFiles.slice(out.length)]);
+    }
+    setBulkFiles(out);
+    setKnownDates(k => new Set([...k, ...out.filter(f => f.status.startsWith("Saved")).map(f => f.shiftDate)]));
+    setBulkBusy(false);
+  };
+
+  const reportListSelect = "id, shift_date, report_date, uploaded_by, uploaded_at, file_name, total_workers, clean_count, missing_out, missing_in, missing_both, over_13, total_bill_hrs";
+
   const loadHistory = async () => {
     if (!supabaseReady()) { setSaveMsg("Database not configured."); return; }
     const { data, error } = await supabase
       .from("reports")
-      .select("id, shift_date, report_date, uploaded_by, shifts_count, issues_count, total_bill_hrs")
-      .order("report_date", { ascending: false })
+      .select(reportListSelect)
+      .order("shift_date", { ascending: false })
       .limit(100);
     if (error) { setSaveMsg("History error: " + error.message); return; }
     setHistory(data || []);
@@ -736,14 +1062,108 @@ export default function App() {
     setMenuOpen(false);
   };
 
+  // Saved results have their Date fields serialized to strings — revive them
+  const reviveResults = (list) => (list || []).map(r => ({
+    ...r,
+    rawIn:  r.rawIn  ? new Date(r.rawIn)  : null,
+    rawOut: r.rawOut ? new Date(r.rawOut) : null,
+    rndIn:  r.rndIn  ? new Date(r.rndIn)  : null,
+    rndOut: r.rndOut ? new Date(r.rndOut) : null,
+    nqIn:   r.nqIn  ? { ...r.nqIn,  ts: new Date(r.nqIn.ts)  } : null,
+    nqOut:  r.nqOut ? { ...r.nqOut, ts: new Date(r.nqOut.ts) } : null,
+  }));
+
   const loadReport = async (id) => {
     const { data, error } = await supabase.from("reports").select("*").eq("id", id).single();
     if (error) { setSaveMsg("Load error: " + error.message); return; }
     const payload = data.results_json || {};
-    setResults(payload.results || []);
+    const revived = reviveResults(payload.results);
+    setResults(revived);
+    mergeSeenGates(revived.flatMap(r => [
+      r.inGate, r.outGate,
+      r.nqIn ? r.nqIn.gate : "", r.nqOut ? r.nqOut.gate : "",
+    ]));
     if (payload.shiftDate) setShiftDate(payload.shiftDate);
     if (payload.reportDate) setReportDate(payload.reportDate);
     setScreen("results");
+  };
+
+  // ── Weekly rollup handlers ──
+  const loadWeekly = async () => {
+    setWeeklyMsg("");
+    setMenuOpen(false);
+    if (!supabaseReady()) { setWeeklyMsg("Database not configured."); setScreen("weekly"); return; }
+    const { data, error } = await supabase
+      .from("reports")
+      .select(reportListSelect)
+      .order("shift_date", { ascending: false })
+      .limit(200);
+    if (error) { setWeeklyMsg("Load error: " + error.message); }
+    setWeeklyReports(data || []);
+    setRollup(null);
+    setScreen("weekly");
+  };
+
+  const toggleSel = (id) => {
+    setSelIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+    setRollup(null);
+  };
+
+  // Quick-select a Monday–Sunday week: 0 = this week, -1 = last week
+  const selectWeek = (offset) => {
+    const today = new Date();
+    const dow = (today.getDay() + 6) % 7; // Monday = 0
+    const mon = addDays(today, -dow + offset * 7);
+    const dates = new Set([...Array(7)].map((_, i) => toYMD(addDays(mon, i))));
+    setSelIds(new Set(weeklyReports.filter(r => dates.has(r.shift_date)).map(r => r.id)));
+    setRollup(null);
+  };
+
+  const buildRollup = async () => {
+    setWeeklyMsg("");
+    const chosen = weeklyReports.filter(r => selIds.has(r.id));
+    if (!chosen.length) { setWeeklyMsg("Select at least one day first."); return; }
+    setWeeklyBusy(true);
+    try {
+      const { data, error } = await supabase
+        .from("reports")
+        .select("id, shift_date, results_json")
+        .in("id", [...selIds]);
+      if (error) throw error;
+      const sorted = (data || []).slice().sort((a, b) => a.shift_date.localeCompare(b.shift_date));
+      const byEmp = {};
+      const dates = [...new Set(sorted.map(r => r.shift_date))].sort();
+      for (const rep of sorted) {
+        const res = (rep.results_json && rep.results_json.results) || [];
+        for (const r of res) {
+          const key = r.guid || `${r.ein}|${r.name}`;
+          const e = byEmp[key] || (byEmp[key] = {
+            name: r.name || "", company: r.company || "", ein: r.ein || "",
+            days: {}, daysWorked: 0, issueDays: 0, total: 0,
+          });
+          // Same date in two selected reports: the later-saved report wins
+          e.days[rep.shift_date] = { billHrs: r.billHrs, status: r.status, over13: r.over13 };
+        }
+      }
+      const emps = Object.values(byEmp).map(e => {
+        let daysWorked = 0, issueDays = 0, total = 0;
+        for (const d of Object.values(e.days)) {
+          if (d.billHrs != null) { daysWorked++; total += d.billHrs; }
+          if (d.status !== "Clean") issueDays++;
+        }
+        return { ...e, daysWorked, issueDays, total };
+      }).sort((a, b) => a.name.localeCompare(b.name));
+      setRollup({ emps, dates });
+      setRollupMeta(chosen.slice().sort((a, b) => a.shift_date.localeCompare(b.shift_date)));
+    } catch (e) {
+      setWeeklyMsg("Rollup error: " + e.message);
+    } finally {
+      setWeeklyBusy(false);
+    }
   };
 
   const handleLogout = () => {
@@ -820,7 +1240,7 @@ export default function App() {
               <table style={{ width:"100%", borderCollapse:"collapse", minWidth:680 }}>
                 <thead>
                   <tr style={{ background:"#060d16", borderBottom:"2px solid #1a2535" }}>
-                    {["Shift Date","Uploaded By","Saved","Shifts","Issues","Total Hrs",""].map(h => (
+                    {["Shift Date","Uploaded By","Saved","Workers","Issues","Total Hrs",""].map(h => (
                       <th key={h} style={{ padding:"9px 12px", textAlign:"left", fontSize:10,
                         color:"#4b5e7a", textTransform:"uppercase", letterSpacing:0.8, fontWeight:600 }}>{h}</th>
                     ))}
@@ -837,10 +1257,10 @@ export default function App() {
                         )}
                       </td>
                       <td style={{ padding:"9px 12px", fontSize:12 }}>{h.uploaded_by}</td>
-                      <td style={{ padding:"9px 12px", fontSize:12 }}>{new Date(h.report_date).toLocaleString()}</td>
-                      <td style={{ padding:"9px 12px", fontSize:12 }}>{h.shifts_count}</td>
-                      <td style={{ padding:"9px 12px", fontSize:12 }}>{h.issues_count}</td>
-                      <td style={{ padding:"9px 12px", fontSize:12 }}>{h.total_bill_hrs}</td>
+                      <td style={{ padding:"9px 12px", fontSize:12 }}>{h.uploaded_at ? new Date(h.uploaded_at).toLocaleString() : ""}</td>
+                      <td style={{ padding:"9px 12px", fontSize:12 }}>{h.total_workers}</td>
+                      <td style={{ padding:"9px 12px", fontSize:12 }}>{(h.total_workers || 0) - (h.clean_count || 0)}</td>
+                      <td style={{ padding:"9px 12px", fontSize:12 }}>{decToHM(Number(h.total_bill_hrs) || 0)}</td>
                       <td style={{ padding:"9px 12px" }}>
                         <button onClick={() => loadReport(h.id)} style={btn(false, "#334155")}>Load</button>
                       </td>
@@ -852,6 +1272,276 @@ export default function App() {
           )}
         </div>
         {saveMsg && <div style={{ marginTop:12, fontSize:12, color:"#4b5e7a" }}>{saveMsg}</div>}
+      </div>
+    );
+  }
+
+  // ── Bulk upload screen (multiple daily CSVs → database) ──
+  if (screen === "bulk") {
+    const savedCount = bulkFiles.filter(f => f.status.startsWith("Saved")).length;
+    return (
+      <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
+        fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 }}>
+          <div>
+            <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>SAVE MULTIPLE DAYS</div>
+            <div style={{ fontSize:11, color:"#4b5e7a", marginTop:2 }}>
+              {bulkFiles.length} file(s) · shift dates auto-detected — adjust before saving
+            </div>
+          </div>
+          <button onClick={() => { setScreen("upload"); setBulkFiles([]); }} style={btn(false, "#334155")}>Back</button>
+        </div>
+
+        <div style={{
+          display:"flex", alignItems:"center", gap:8, marginBottom:12,
+          background:"#0d1520", border:"1px solid #1a2d45",
+          borderRadius:8, padding:"8px 12px", maxWidth:420,
+        }}>
+          <span style={{ fontSize:10, color:"#4b5e7a", textTransform:"uppercase", letterSpacing:1, flexShrink:0 }}>Uploader</span>
+          <input
+            type="text" value={uploadedBy} onChange={e => setUploadedBy(e.target.value)}
+            placeholder="Your name (required to save)"
+            style={{ background:"transparent", border:"none", color:"#e2e8f0",
+              fontFamily:"'DM Mono',monospace", fontSize:13, outline:"none", width:"100%" }}
+          />
+        </div>
+
+        <div style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden", marginBottom:14 }}>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", minWidth:720 }}>
+              <thead>
+                <tr style={{ background:"#060d16", borderBottom:"2px solid #1a2535" }}>
+                  {["File","Shift Date","Report Date","Rows","Status"].map(h => (
+                    <th key={h} style={{ padding:"9px 12px", textAlign:"left", fontSize:10,
+                      color:"#4b5e7a", textTransform:"uppercase", letterSpacing:0.8, fontWeight:600 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {bulkFiles.map((f, i) => (
+                  <tr key={i} style={{ borderBottom:"1px solid #1a2535" }}>
+                    <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace", wordBreak:"break-all" }}>{f.name}</td>
+                    <td style={{ padding:"9px 12px" }}>
+                      <input type="date" value={f.shiftDate}
+                        onChange={e => setBulkFiles(fs => fs.map((x, j) => j === i
+                          ? { ...x, shiftDate: e.target.value,
+                              reportDate: e.target.value ? toYMD(addDays(new Date(e.target.value + "T00:00:00"), 1)) : x.reportDate }
+                          : x))}
+                        style={{ ...inp, width:150 }} />
+                      {knownDates.has(f.shiftDate) && !f.status.startsWith("Saved") && (
+                        <div style={{ color:"#fb923c", fontSize:10, marginTop:3 }}>⚠ already in database — saving again creates a duplicate</div>
+                      )}
+                    </td>
+                    <td style={{ padding:"9px 12px" }}>
+                      <input type="date" value={f.reportDate}
+                        onChange={e => setBulkFiles(fs => fs.map((x, j) => j === i ? { ...x, reportDate: e.target.value } : x))}
+                        style={{ ...inp, width:150 }} />
+                    </td>
+                    <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace" }}>{f.rows.length}</td>
+                    <td style={{ padding:"9px 12px", fontSize:12,
+                      color: f.status.startsWith("Saved") ? "#34d399" : f.status ? "#f87171" : "#4b5e7a" }}>
+                      {f.status || "Ready"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+          <button
+            onClick={runBulk}
+            disabled={bulkBusy}
+            style={{
+              background: bulkBusy ? "#1a2d45" : "#1d4ed8", color:"#fff", border:"none",
+              borderRadius:6, padding:"10px 18px", fontSize:13, fontWeight:600,
+              cursor: bulkBusy ? "default" : "pointer", fontFamily:"'DM Mono',monospace",
+            }}
+          >{bulkBusy ? "Saving…" : "Process & Save All"}</button>
+          {savedCount > 0 && (
+            <button onClick={loadWeekly} style={{ ...btn(true, "#0e7490"), background:"#0e7490", color:"#fff" }}>
+              📅 Go to Weekly Rollup →
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Weekly rollup screen ──
+  if (screen === "weekly") {
+    const selReports = weeklyReports.filter(r => selIds.has(r.id));
+    const dateCounts = {};
+    selReports.forEach(r => { dateCounts[r.shift_date] = (dateCounts[r.shift_date] || 0) + 1; });
+    const dupSelected = Object.values(dateCounts).some(n => n > 1);
+    const fmtD = d => `${d.slice(5,7)}/${d.slice(8,10)}`;
+    const shownEmps = rollup
+      ? rollup.emps.filter(e => !weeklySearch ||
+          e.name.toLowerCase().includes(weeklySearch.toLowerCase()) ||
+          (e.ein || "").includes(weeklySearch))
+      : [];
+    const grandTotal = rollup ? rollup.emps.reduce((s, e) => s + e.total, 0) : 0;
+    const issueCells = rollup ? rollup.emps.reduce((s, e) => s + e.issueDays, 0) : 0;
+
+    return (
+      <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
+        fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 }}>
+          <div>
+            <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>WEEKLY ROLLUP</div>
+            <div style={{ fontSize:11, color:"#4b5e7a", marginTop:2 }}>
+              Pick the saved days to include, then build the rollup
+            </div>
+          </div>
+          <button onClick={() => setScreen(results.length ? "results" : "upload")} style={btn(false, "#334155")}>Back</button>
+        </div>
+
+        {weeklyMsg && (
+          <div style={{ background:"#3f1d1d", border:"1px solid #7f1d1d", color:"#e2e8f0",
+            padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10 }}>{weeklyMsg}</div>
+        )}
+
+        {/* Day picker */}
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10, alignItems:"center" }}>
+          <button onClick={() => selectWeek(0)}  style={btn(false, "#1d4ed8")}>This Week</button>
+          <button onClick={() => selectWeek(-1)} style={btn(false, "#1d4ed8")}>Last Week</button>
+          {selIds.size > 0 && (
+            <button onClick={() => { setSelIds(new Set()); setRollup(null); }} style={btn(false, "#334155")}>Clear</button>
+          )}
+          <span style={{ fontSize:11, color:"#4b5e7a", fontFamily:"'DM Mono',monospace" }}>
+            {selIds.size} day(s) selected
+          </span>
+        </div>
+
+        {dupSelected && (
+          <div style={{ background:"#3b2500", border:"1px solid #9a3412", color:"#fb923c",
+            padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10 }}>
+            ⚠ Two reports with the same shift date are selected — the later-saved one counts for that day.
+          </div>
+        )}
+
+        <div style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden", marginBottom:14 }}>
+          {weeklyReports.length === 0 ? (
+            <div style={{ padding:24, color:"#4b5e7a", fontSize:13 }}>
+              No saved daily reports yet. Upload CSVs (drop several at once) and save them first.
+            </div>
+          ) : (
+            <div style={{ overflowX:"auto", maxHeight:300, overflowY:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", minWidth:680 }}>
+                <thead>
+                  <tr style={{ background:"#060d16", borderBottom:"2px solid #1a2535" }}>
+                    {["","Shift Date","File","Uploaded By","Workers","Total Hrs"].map((h, i) => (
+                      <th key={i} style={{ padding:"9px 12px", textAlign:"left", fontSize:10,
+                        color:"#4b5e7a", textTransform:"uppercase", letterSpacing:0.8, fontWeight:600,
+                        position:"sticky", top:0, background:"#060d16" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {weeklyReports.map(r => (
+                    <tr key={r.id}
+                      onClick={() => toggleSel(r.id)}
+                      style={{ borderBottom:"1px solid #1a2535", cursor:"pointer",
+                        background: selIds.has(r.id) ? "#0d1e30" : "transparent" }}>
+                      <td style={{ padding:"9px 12px" }}>
+                        <input type="checkbox" readOnly checked={selIds.has(r.id)} style={{ cursor:"pointer" }} />
+                      </td>
+                      <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace" }}>{r.shift_date}</td>
+                      <td style={{ padding:"9px 12px", fontSize:11, fontFamily:"'DM Mono',monospace",
+                        color:"#6b7a8d", wordBreak:"break-all" }}>{r.file_name || "—"}</td>
+                      <td style={{ padding:"9px 12px", fontSize:12 }}>{r.uploaded_by}</td>
+                      <td style={{ padding:"9px 12px", fontSize:12 }}>{r.total_workers}</td>
+                      <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace" }}>
+                        {decToHM(Number(r.total_bill_hrs) || 0)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:16 }}>
+          <button
+            onClick={buildRollup}
+            disabled={weeklyBusy || !selIds.size}
+            style={{
+              background: weeklyBusy || !selIds.size ? "#1a2d45" : "#1d4ed8", color:"#fff", border:"none",
+              borderRadius:6, padding:"10px 18px", fontSize:13, fontWeight:600,
+              cursor: weeklyBusy || !selIds.size ? "default" : "pointer", fontFamily:"'DM Mono',monospace",
+            }}
+          >{weeklyBusy ? "Building…" : "Build Rollup"}</button>
+          {rollup && (
+            <button
+              onClick={() => exportWeeklyXLSX(rollup, rollupMeta, rules)}
+              style={{ ...btn(true, "#1d4ed8"), background:"#0e7490", borderColor:"#0e7490", color:"#fff" }}
+            >↓ Excel</button>
+          )}
+        </div>
+
+        {rollup && (<>
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
+            <StatCard label="Employees"   value={rollup.emps.length}    color="#3b82f6" />
+            <StatCard label="Days"        value={rollup.dates.length}   color="#0ea5e9" />
+            <StatCard label="Issue Days"  value={issueCells}            color="#ef4444" />
+            <StatCard label="Total Hrs"   value={decToHM(grandTotal)}   color="#22c55e" />
+          </div>
+
+          <div style={{ marginBottom:10 }}>
+            <input
+              placeholder="Search name or EIN…"
+              value={weeklySearch}
+              onChange={e => setWeeklySearch(e.target.value)}
+              style={{...inp, maxWidth:320}}
+            />
+          </div>
+
+          <div style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden" }}>
+            <div style={{ overflowX:"auto", WebkitOverflowScrolling:"touch" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", minWidth:680 }}>
+                <thead>
+                  <tr style={{ background:"#060d16", borderBottom:"2px solid #1a2535" }}>
+                    {["Employee Name","Company","EIN", ...rollup.dates.map(fmtD), "Days","Total"].map((h, i) => (
+                      <th key={i} style={{ padding:"9px 12px", textAlign:"left", fontSize:10,
+                        color:"#4b5e7a", textTransform:"uppercase", letterSpacing:0.8,
+                        fontWeight:600, whiteSpace:"nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {shownEmps.map((e, i) => (
+                    <tr key={i} style={{ borderBottom:"1px solid #1a2535",
+                      background: i % 2 === 0 ? "#0d1520" : "#0a1118" }}>
+                      <td style={{ ...td, whiteSpace:"nowrap" }}>{e.name}</td>
+                      <td style={{ ...td, color:"#6b7a8d" }}>{e.company}</td>
+                      <td style={{ ...td, color:"#6b7a8d", fontFamily:"'DM Mono',monospace" }}>{e.ein}</td>
+                      {rollup.dates.map(d => {
+                        const day = e.days[d];
+                        return (
+                          <td key={d} style={{ ...td, fontFamily:"'DM Mono',monospace", fontSize:12,
+                            color: !day ? "#374151" : day.billHrs == null ? "#ef4444" : day.over13 ? "#fb923c" : "#c8d6e8" }}>
+                            {!day ? "—" : day.billHrs == null ? "MISS" : decToHM(day.billHrs)}
+                          </td>
+                        );
+                      })}
+                      <td style={{ ...td, fontFamily:"'DM Mono',monospace" }}>{e.daysWorked}</td>
+                      <td style={{ ...td, fontFamily:"'DM Mono',monospace", fontWeight:700, color:"#e2e8f0" }}>
+                        {decToHM(e.total)}
+                      </td>
+                    </tr>
+                  ))}
+                  {!shownEmps.length && (
+                    <tr><td colSpan={5 + rollup.dates.length} style={{ padding:36, textAlign:"center", color:"#4b5e7a" }}>
+                      No records match.
+                    </td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>)}
       </div>
     );
   }
@@ -935,6 +1625,7 @@ export default function App() {
           </div>
         </div>
         <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+          <button onClick={loadWeekly} style={btn(false, "#334155")}>📅 Weekly</button>
           <button onClick={() => setShowConfig(c => !c)} style={btn(showConfig, "#334155")}>
             ⚙ Config
           </button>
@@ -963,6 +1654,7 @@ export default function App() {
               <div style={{ position:"absolute", right:0, top:34, background:"#0a1320",
                 border:"1px solid #1a2535", borderRadius:8, padding:6, minWidth:140, zIndex:20 }}>
                 <button onClick={loadHistory} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>History</button>
+                <button onClick={loadWeekly} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>Weekly Rollup</button>
                 <button onClick={handleLogout} style={{ ...btn(false, "#334155"), width:"100%", color:"#ef4444", borderColor:"#7f1d1d" }}>Logout</button>
               </div>
             )}
@@ -989,14 +1681,148 @@ export default function App() {
           </div>
           <div style={{ marginTop:10 }}>
             <label style={{ fontSize:10, color:"#4b5e7a", textTransform:"uppercase", letterSpacing:1 }}>
-              Off-Site (NQ) Gates — one per line, exact match
+              Gate List (checked = off site, excluded from calculations)
             </label>
             <div style={{ fontSize:10, color:"#4b5e7a", marginTop:2, marginBottom:3,
               fontFamily:"'DM Mono',monospace" }}>
-              ⚠ S-Curve Turnstile 2 not listed — add here if needed
+              Gate names collect here automatically from uploaded CSVs. Unchecked gates count as qualifying.
             </div>
-            <textarea value={nqText} onChange={e => setNqText(e.target.value)}
-              rows={7} style={{...inp, marginTop:3, resize:"vertical"}} />
+            {(() => {
+              const nqSet = currentGates();
+              const allGates = [...new Set([...seenGates, ...nqSet])].sort();
+              return (
+                <div style={{ background:"#0d1520", border:"1px solid #1a2d45", borderRadius:6,
+                  marginTop:3, maxHeight:230, overflowY:"auto", padding:"4px 10px" }}>
+                  {!allGates.length && (
+                    <div style={{ fontSize:11, color:"#4b5e7a", padding:"8px 0" }}>
+                      No gates yet. Upload a CSV or add a gate below.
+                    </div>
+                  )}
+                  {allGates.map(g => {
+                    const excluded = nqSet.has(g);
+                    return (
+                      <label key={g} style={{ display:"flex", alignItems:"center", gap:8,
+                        padding:"4px 0", cursor:"pointer", fontSize:12,
+                        fontFamily:"'DM Mono',monospace",
+                        color: excluded ? "#fb923c" : "#c8d6e8" }}>
+                        <input
+                          type="checkbox"
+                          checked={excluded}
+                          onChange={() => {
+                            // Keep the gate visible in the list even after unchecking
+                            mergeSeenGates([g]);
+                            const next = new Set(nqSet);
+                            if (excluded) next.delete(g); else next.add(g);
+                            setNqText([...next].sort().join("\n"));
+                          }}
+                          style={{ cursor:"pointer", flexShrink:0 }}
+                        />
+                        <span style={{ wordBreak:"break-all" }}>{g}</span>
+                        <span style={{ marginLeft:"auto", flexShrink:0, fontSize:9, letterSpacing:0.5,
+                          color: excluded ? "#fb923c" : "#34d399" }}>
+                          {excluded ? "OFF SITE" : "QUALIFYING"}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+            <div style={{ display:"flex", gap:8, marginTop:8, maxWidth:420 }}>
+              <input
+                value={newGate}
+                onChange={e => setNewGate(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter") addGate(); }}
+                placeholder="Add a gate name (exact match)"
+                style={inp}
+              />
+              <button onClick={addGate} style={{ ...btn(true, "#334155"), background:"#334155",
+                color:"#fff", flexShrink:0 }}>Add</button>
+            </div>
+            <div style={{ fontSize:10, color:"#4b5e7a", marginTop:6, fontFamily:"'DM Mono',monospace" }}>
+              {currentGates().size} gate(s) excluded. Checked gates apply to the next upload on this device. Save Config for Team to apply for everyone.
+              {!currentGates().has("S-Curve Turnstile 2") &&
+                " Note: S-Curve Turnstile 2 counts as qualifying by design. Check it if that should change."}
+            </div>
+          </div>
+
+          {/* ── Rounding rules ── */}
+          <div style={{ marginTop:14, paddingTop:14, borderTop:"1px solid #1a2535" }}>
+            <label style={{ fontSize:10, color:"#4b5e7a", textTransform:"uppercase", letterSpacing:1 }}>
+              Rounding Rules
+            </label>
+            <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginTop:6, alignItems:"flex-end" }}>
+              <div style={{ flex:"1 1 150px", maxWidth:200 }}>
+                <div style={{ fontSize:10, color:"#4b5e7a", marginBottom:3 }}>Round to nearest</div>
+                <select
+                  value={rules.roundTo}
+                  onChange={e => {
+                    const roundTo = Number(e.target.value);
+                    // Sensible midpoint default when the interval changes: exact half
+                    setRules(r => ({ ...r, roundTo,
+                      midpointSec: roundTo === 30 ? 930 : Math.floor(roundTo * 60 / 2) }));
+                  }}
+                  style={{ ...inp, cursor:"pointer" }}
+                >
+                  <option value={15}>15 minutes</option>
+                  <option value={30}>30 minutes</option>
+                  <option value={60}>60 minutes</option>
+                  <option value={0}>No rounding</option>
+                </select>
+              </div>
+              {rules.roundTo > 0 && (
+                <div style={{ flex:"1 1 150px", maxWidth:200 }}>
+                  <div style={{ fontSize:10, color:"#4b5e7a", marginBottom:3 }}>
+                    Round up at (min:sec past mark)
+                  </div>
+                  <input
+                    type="text"
+                    value={midpointToStr(rules.midpointSec)}
+                    onChange={e => {
+                      const m = e.target.value.match(/^(\d{1,2}):?(\d{0,2})$/);
+                      if (m) {
+                        const sec = Number(m[1]) * 60 + Number(m[2] || 0);
+                        setRules(r => ({ ...r, midpointSec: sec }));
+                      }
+                    }}
+                    style={inp}
+                  />
+                </div>
+              )}
+              <div style={{ flex:"1 1 150px", maxWidth:200 }}>
+                <div style={{ fontSize:10, color:"#4b5e7a", marginBottom:3 }}>Lunch deduction (min)</div>
+                <input
+                  type="number" min="0" step="5"
+                  value={rules.lunchMin}
+                  onChange={e => setRules(r => ({ ...r, lunchMin: Math.max(0, Number(e.target.value) || 0) }))}
+                  style={inp}
+                />
+              </div>
+            </div>
+            <div style={{ fontSize:10, color:"#4b5e7a", marginTop:6, fontFamily:"'DM Mono',monospace" }}>
+              Current rule: {rulesSummary(rules)} · lunch {rules.lunchMin} min. Applies to new uploads — saved reports keep the numbers they were saved with.
+            </div>
+          </div>
+
+          {/* ── Save config for the team ── */}
+          <div style={{ marginTop:12, display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+            <button
+              onClick={handleSaveConfig}
+              style={{
+                background:"#1d4ed8", color:"#fff", border:"none",
+                borderRadius:6, padding:"8px 14px", fontSize:12, fontWeight:600,
+                cursor:"pointer", fontFamily:"'DM Mono',monospace",
+              }}
+            >💾 Save Config for Team</button>
+            {cfgMeta && !cfgMsg && (
+              <span style={{ fontSize:11, color:"#4b5e7a", fontFamily:"'DM Mono',monospace" }}>
+                last saved by {cfgMeta.updated_by} · {new Date(cfgMeta.updated_at).toLocaleString()}
+              </span>
+            )}
+            {cfgMsg && (
+              <span style={{ fontSize:12, fontFamily:"'DM Mono',monospace",
+                color: cfgMsg.includes("error") ? "#f87171" : "#34d399" }}>{cfgMsg}</span>
+            )}
           </div>
 
           {/* ── Employee Roster Upload ── */}
@@ -1113,11 +1939,13 @@ export default function App() {
             >
               <div style={{ fontSize:36, marginBottom:10 }}>📂</div>
               <div style={{ fontSize:15, fontWeight:600, color:"#e2e8f0" }}>
-                {processing ? "Processing…" : fileName || "Tap to browse or drop CSV"}
+                {processing ? "Processing…" : fileName || "Tap to browse or drop CSV files"}
               </div>
-              <div style={{ fontSize:11, color:"#4b5e7a", marginTop:4 }}>Genetec raw export (.csv)</div>
-              <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}}
-                onChange={e => processFile(e.target.files[0])} />
+              <div style={{ fontSize:11, color:"#4b5e7a", marginTop:4 }}>
+                Genetec raw export (.csv) — drop several days at once to save them all to the database
+              </div>
+              <input ref={fileRef} type="file" accept=".csv" multiple style={{display:"none"}}
+                onChange={e => { handleFiles(e.target.files); e.target.value = ""; }} />
             </div>
 
             {error && (
