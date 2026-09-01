@@ -31,7 +31,29 @@ function toDateStr(d) {
 // ── ROUNDING RULES (configurable via Config panel, stored in database) ────────
 // Defaults preserve original behavior: nearest 30 min via 15:30 (930 sec) midpoint,
 // 30 min lunch deduction.
-const RULES_DEFAULT = { roundTo: 30, midpointSec: 930, lunchMin: 30 };
+// earliestInMin: INs before this time of day (minutes from midnight) count as
+//   exactly this time. 0 turns the rule off.
+// lunchOverHrs: lunch comes off only when the rounded span is strictly longer
+//   than this many hours. 0 means lunch comes off every day.
+// inWindowHrs: a qualifying IN only counts within this many hours of the
+//   person's first badge anywhere on site that day. 0 turns the rule off.
+const RULES_DEFAULT = { roundTo: 30, midpointSec: 930, lunchMin: 30, earliestInMin: 0, lunchOverHrs: 0, inWindowHrs: 0 };
+
+function minutesToClock(min) {
+  const h = Math.floor(min / 60), m = min % 60;
+  const ap = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 || 12;
+  return `${h12}:${String(m).padStart(2, "0")} ${ap}`;
+}
+
+// The optional rules, summarized only when they are switched on
+function extraRulesSummary(rules) {
+  const parts = [];
+  if (rules.earliestInMin > 0) parts.push(`INs before ${minutesToClock(rules.earliestInMin)} count as ${minutesToClock(rules.earliestInMin)}`);
+  if (rules.lunchOverHrs > 0) parts.push(`lunch only over ${rules.lunchOverHrs} hrs`);
+  if (rules.inWindowHrs > 0) parts.push(`IN counted only within ${rules.inWindowHrs} hrs of first badge`);
+  return parts.join("  |  ");
+}
 
 function midpointToStr(sec) {
   const m = Math.floor(sec / 60);
@@ -154,10 +176,24 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAU
     if (!empMap[r.guid]) empMap[r.guid] = { name: r.name, company: r.company, ein: r.ein };
   });
 
+  // Optional window rule: a qualifying IN only counts within {inWindowHrs}
+  // hours of the person's first badge anywhere on site that day, NQ included
+  const firstAnyIn = {};
+  if (rules.inWindowHrs > 0) {
+    df.filter(r => r.access === "In" && sameDay(r.ts, shiftDate))
+      .forEach(r => { if (!firstAnyIn[r.guid]) firstAnyIn[r.guid] = r.ts; });
+  }
+
   // First qualifying IN on shift date per person
   const inMap = {};
   dfQ.filter(r => r.access === "In" && sameDay(r.ts, shiftDate))
-     .forEach(r => { if (!inMap[r.guid]) inMap[r.guid] = { ts: r.ts, gate: r.area }; });
+     .forEach(r => {
+       if (rules.inWindowHrs > 0) {
+         const anchor = firstAnyIn[r.guid];
+         if (anchor && (r.ts - anchor) / 3600000 > rules.inWindowHrs) return;
+       }
+       if (!inMap[r.guid]) inMap[r.guid] = { ts: r.ts, gate: r.area };
+     });
 
   // NQ reference: first NQ IN, last NQ OUT
   const nqInMap = {}, nqOutMap = {};
@@ -193,14 +229,26 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAU
     const outRec = getValidOut(guid, rawIn);
     const rawOut = outRec ? outRec.ts : null;
 
-    const rndIn  = roundTime(rawIn, rules);
+    // Optional early start floor: an IN before the earliest counted time bills
+    // from exactly that time instead of rounding (a 5:40 IN counts as 6:00)
+    let rndIn = roundTime(rawIn, rules);
+    if (rawIn && rules.earliestInMin > 0) {
+      const todSec = rawIn.getHours() * 3600 + rawIn.getMinutes() * 60 + rawIn.getSeconds();
+      if (todSec < rules.earliestInMin * 60) {
+        rndIn = new Date(rawIn);
+        rndIn.setHours(Math.floor(rules.earliestInMin / 60), rules.earliestInMin % 60, 0, 0);
+      }
+    }
     const rndOut = roundTime(rawOut, rules);
 
     let rawHrs = null, lessLunch = null, billHrs = null;
     if (rndIn && rndOut) {
       const elapsedMin = (rndOut - rndIn) / 60000;
       if (elapsedMin > 0) {
-        const netMin  = Math.max(elapsedMin - rules.lunchMin, 0);
+        // Lunch comes off every day unless a threshold is set, then only on
+        // days whose rounded span is strictly longer than the threshold
+        const takeLunch = !rules.lunchOverHrs || elapsedMin / 60 > rules.lunchOverHrs;
+        const netMin  = Math.max(elapsedMin - (takeLunch ? rules.lunchMin : 0), 0);
         rawHrs    = +(elapsedMin / 60).toFixed(4);
         lessLunch = +(netMin / 60).toFixed(4);
         billHrs   = lessLunch; // Billable = rndOut - rndIn - lunch; no second rounding pass
@@ -309,7 +357,8 @@ function exportXLSX(results, shiftDate, reportDate, nqGates, rules = RULES_DEFAU
     [(rules.roundTo > 0
        ? `Rounding: Raw IN and Raw OUT each rounded independently to nearest ${rules.roundTo} min via ${midpointToStr(rules.midpointSec)} midpoint rule`
        : "Rounding: none — exact badge times used") +
-     `  |  Billable = (Rounded OUT minus Rounded IN) minus ${rules.lunchMin} min lunch  |  Times displayed as H:MM`],
+     `  |  Billable = (Rounded OUT minus Rounded IN) minus ${rules.lunchMin} min lunch  |  Times displayed as H:MM` +
+     (extraRulesSummary(rules) ? `  |  ${extraRulesSummary(rules)}` : "")],
     dataColHdrs,
     ...results.map(dataRows),
   ]);
@@ -356,6 +405,12 @@ function exportXLSX(results, shiftDate, reportDate, nqGates, rules = RULES_DEFAU
     ["RULES", "Value", "Notes"],
     ["Rounding Rule",    rulesSummary(rules), "Editable in the app Config panel"],
     ["Lunch Deduction",  `${rules.lunchMin} minutes`, "Applied when both IN and OUT exist"],
+    ["Lunch Threshold",  rules.lunchOverHrs > 0 ? `Only days over ${rules.lunchOverHrs} hrs` : "Every day",
+     "Rounded span must be strictly longer than the threshold for lunch to come off"],
+    ["Earliest Counted IN", rules.earliestInMin > 0 ? minutesToClock(rules.earliestInMin) : "Off",
+     "Badge INs before this time count as exactly this time"],
+    ["IN Window",        rules.inWindowHrs > 0 ? `${rules.inWindowHrs} hrs after first badge` : "Off",
+     "Qualifying IN counts only within the window after the first badge of the day"],
     ["Badge IN Logic",   "First qualifying IN on shift date only", "Report date INs are excluded"],
     ["Badge OUT Logic",  "Last qualifying OUT per AM/PM rule", "AM IN: same date OUT | PM IN: same date or next AM"],
     ["NQ Gate Rule",     "Off-site swipes shown as reference only", "Not used in calculations"],
@@ -408,7 +463,8 @@ function exportWeeklyXLSX(rollup, dayMeta, rules = RULES_DEFAULT) {
     [(rules.roundTo > 0
        ? `Rounding: nearest ${rules.roundTo} min via ${midpointToStr(rules.midpointSec)} midpoint`
        : "Rounding: none") +
-     `  |  Lunch: ${rules.lunchMin} min  |  MISS = badge record incomplete that day (0 hrs counted)  |  Times as H:MM`],
+     `  |  Lunch: ${rules.lunchMin} min  |  MISS = badge record incomplete that day (0 hrs counted)  |  Times as H:MM` +
+     (extraRulesSummary(rules) ? `  |  ${extraRulesSummary(rules)}` : "")],
     hdrs,
     ...emps.map(empRow),
     [],
@@ -747,6 +803,9 @@ export default function App() {
       roundTo: Math.max(0, Number(rules.roundTo) || 0),
       midpointSec: Math.max(0, Number(rules.midpointSec) || 0),
       lunchMin: Math.max(0, Number(rules.lunchMin) || 0),
+      earliestInMin: Math.max(0, Number(rules.earliestInMin) || 0),
+      lunchOverHrs: Math.max(0, Number(rules.lunchOverHrs) || 0),
+      inWindowHrs: Math.max(0, Number(rules.inWindowHrs) || 0),
     };
     // The shared seen gate list keeps the checklist consistent for the whole team
     const knownUnion = [...new Set([...seenGates, ...gates])].sort();
@@ -1798,9 +1857,41 @@ export default function App() {
                   style={inp}
                 />
               </div>
+              <div style={{ flex:"1 1 150px", maxWidth:200 }}>
+                <div style={{ fontSize:10, color:"#4b5e7a", marginBottom:3 }}>Lunch only over (hrs, 0 = every day)</div>
+                <input
+                  type="number" min="0" step="0.5"
+                  value={rules.lunchOverHrs}
+                  onChange={e => setRules(r => ({ ...r, lunchOverHrs: Math.max(0, Number(e.target.value) || 0) }))}
+                  style={inp}
+                />
+              </div>
+              <div style={{ flex:"1 1 150px", maxWidth:200 }}>
+                <div style={{ fontSize:10, color:"#4b5e7a", marginBottom:3 }}>Earliest counted IN (blank = off)</div>
+                <input
+                  type="time"
+                  value={rules.earliestInMin > 0
+                    ? `${String(Math.floor(rules.earliestInMin / 60)).padStart(2, "0")}:${String(rules.earliestInMin % 60).padStart(2, "0")}`
+                    : ""}
+                  onChange={e => {
+                    const m = e.target.value.match(/^(\d{2}):(\d{2})$/);
+                    setRules(r => ({ ...r, earliestInMin: m ? Number(m[1]) * 60 + Number(m[2]) : 0 }));
+                  }}
+                  style={inp}
+                />
+              </div>
+              <div style={{ flex:"1 1 150px", maxWidth:200 }}>
+                <div style={{ fontSize:10, color:"#4b5e7a", marginBottom:3 }}>IN window after first badge (hrs, 0 = off)</div>
+                <input
+                  type="number" min="0" step="0.5"
+                  value={rules.inWindowHrs}
+                  onChange={e => setRules(r => ({ ...r, inWindowHrs: Math.max(0, Number(e.target.value) || 0) }))}
+                  style={inp}
+                />
+              </div>
             </div>
             <div style={{ fontSize:10, color:"#4b5e7a", marginTop:6, fontFamily:"'DM Mono',monospace" }}>
-              Current rule: {rulesSummary(rules)} · lunch {rules.lunchMin} min. Applies to new uploads — saved reports keep the numbers they were saved with.
+              Current rule: {rulesSummary(rules)} · lunch {rules.lunchMin} min.{extraRulesSummary(rules) && ` ${extraRulesSummary(rules)}.`} Applies to new uploads — saved reports keep the numbers they were saved with.
             </div>
           </div>
 
