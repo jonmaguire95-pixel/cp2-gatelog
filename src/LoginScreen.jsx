@@ -811,11 +811,12 @@ export default function LoginScreen({ step = null, email = "", notice = null, on
           <div className="lg-tagline">Badge hours for the CP2 LNG field workforce</div>
         </header>
 
-        {step
-          ? <PasswordStep mode={step} email={email} onSaved={onPasswordSaved} onSignOut={onSignOut} />
-          : <AccountForms initialNotice={notice} />}
-
-        <QuoteRotator quotes={QUOTES} author={QUOTE_AUTHOR} />
+        <div className="lg-stage">
+          {step
+            ? <PasswordStep mode={step} email={email} onSaved={onPasswordSaved} onSignOut={onSignOut} />
+            : <AccountForms initialNotice={notice} />}
+          <QuoteRotator quotes={QUOTES} author={QUOTE_AUTHOR} />
+        </div>
 
         <p className="lg-notice">Authorized MMR personnel only.</p>
       </main>
@@ -847,15 +848,16 @@ const LOGIN_CSS = `
 }
 .lg-skyline {
   position: absolute; left: 0; right: 0; bottom: 0;
-  width: 100%; height: 46vh; min-height: 260px; max-height: 540px;
+  width: 100%; height: auto; aspect-ratio: 1600 / 520; max-height: 64vh;
 }
 .lg-main {
   position: relative; z-index: 1;
   min-height: 100vh; min-height: 100dvh;
   display: flex; flex-direction: column; align-items: center;
-  padding: max(7vh, 32px) 16px 48px;
+  padding: max(3vh, 16px) 16px 28px;
 }
-.lg-brand { display: flex; flex-direction: column; align-items: center; text-align: center; color: #fff; margin-bottom: 22px; }
+.lg-stage { display: flex; flex-direction: column; align-items: center; width: 100%; }
+.lg-brand { display: flex; flex-direction: column; align-items: center; text-align: center; color: #fff; margin-bottom: 16px; }
 .lg-system {
   margin-top: 14px; padding-left: 0.34em;
   font-family: 'DM Mono', ui-monospace, monospace; font-size: 13px; letter-spacing: 0.34em; color: #f8c700;
@@ -927,7 +929,7 @@ const LOGIN_CSS = `
   animation-name: lgFill; animation-timing-function: linear; animation-fill-mode: forwards;
 }
 @keyframes lgFill { from { transform: scaleX(0); } to { transform: scaleX(1); } }
-.lg-notice { margin: 26px 0 0; font-size: 11px; letter-spacing: 0.04em; color: rgba(233,230,225,0.45); }
+.lg-notice { margin: 22px 0 0; font-size: 11px; letter-spacing: 0.04em; color: rgba(233,230,225,0.45); }
 .lg-titleblock {
   position: absolute; right: 20px; bottom: 20px; z-index: 1; min-width: 250px;
   font-family: 'DM Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
@@ -983,11 +985,18 @@ const LOGIN_CSS = `
 .lg-back:focus-visible { outline: 2px solid rgba(248,199,0,0.45); }
 .lg-back-tight { margin-top: 2px; }
 .lg-code { font-size: 20px; letter-spacing: 0.3em; }
-@media (max-width: 900px) { .lg-titleblock { display: none; } }
+@media (min-width: 960px) {
+  /* side by side; on narrower desktops the pair sits a little left so the flare stays in view beside the card */
+  .lg-stage { flex-direction: row; align-items: center; justify-content: center; gap: 48px; padding-right: clamp(0px, calc((1500px - 100vw) * 0.9), 140px); }
+  .lg-stage .lg-card { flex: 0 0 400px; }
+  .lg-quote-panel { order: -1; flex: 0 1 380px; margin: 0; padding-right: 0; }
+}
+@media (max-width: 959px) { .lg-titleblock { display: none; } }
+@media (max-height: 760px) { .lg-titleblock { display: none; } }
+@media (max-width: 640px) { .lg-skyline { height: 34vh; aspect-ratio: auto; max-height: none; } }
 @media (max-width: 480px) {
   .lg-card { padding: 24px 18px 20px; }
   .lg-quote p { font-size: 16px; }
-  .lg-skyline { height: 34vh; }
 }
 @media (prefers-reduced-motion: reduce) {
   .lg-flame, .lg-flare-glow, .lg-beacon { animation: none; }
