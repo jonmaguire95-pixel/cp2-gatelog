@@ -263,15 +263,18 @@ function swipeCount(rows) {
 const NO_SWIPES = "No badge swipes found. Use the Genetec raw export.";
 
 // Exports of the same day overlap (the .2 file is usually a later, longer pull
-// of the first one). Identical swipes are kept once.
+// of the first one). Identical swipes are kept once. The .csv and .xlsx
+// exports write times differently, so the time is compared as a time.
 function mergeRows(lists) {
   const seen = new Set();
   const out = [];
   for (const rows of lists) {
     for (const r of rows) {
+      const raw = r["Event Timestamp"] || r["EventTimestamp"] || "";
+      const t = parseDate(raw);
       const key = [
         r["CardholderGuid"] || r["Cardholder Guid"] || "",
-        r["Event Timestamp"] || r["EventTimestamp"] || "",
+        t ? t.getTime() : raw,
         r["Door"] || "", r["Access Point"] || "", r["Area"] || "", r["Event"] || "",
       ].join("|");
       if (seen.has(key)) continue;
@@ -1432,11 +1435,32 @@ export default function App() {
         g.names.push(f.name);
         g.lists.push(f.rows);
       }
+      // Any file dropped together can hold swipes for a given day: the Monday
+      // weekly file holds the whole week (including swipes that reached
+      // Genetec after the daily pull), and the next day's files hold the
+      // morning after the daily pull stopped. Each day takes its own files plus
+      // every other file's swipes from that day and the next morning up to
+      // 9:00 AM, the end of the night shift OUT window. Nothing from other
+      // days is used.
+      const timed = read.filter(f => !f.problem).map(f => ({
+        rows: f.rows,
+        t: f.rows.map(r => { const d = parseDate(r["Event Timestamp"] || r["EventTimestamp"] || ""); return d ? d.getTime() : NaN; }),
+      }));
       const prepared = Object.entries(groups).map(([sd, g]) => {
-        const rows = g.lists.length > 1 ? mergeRows(g.lists) : g.lists[0];
-        const dates = rowDates(rows);
+        const own = g.lists.length > 1 ? mergeRows(g.lists) : g.lists[0];
+        const start = new Date(sd + "T00:00:00").getTime();
+        const end = addDays(new Date(sd + "T00:00:00"), 1).setHours(9, 0, 0, 0);
+        const extra = [];
+        for (const f of timed) {
+          if (g.lists.includes(f.rows)) continue;
+          f.rows.forEach((r, i) => { if (f.t[i] >= start && f.t[i] < end) extra.push(r); });
+        }
+        const rows = extra.length ? mergeRows([own, extra]) : own;
+        const added = rows.length - own.length;
+        const dates = rowDates(own);
         const notes = [];
         if (g.names.length > 1) notes.push(`${g.names.length} files combined, duplicate swipes removed`);
+        if (added > 0) notes.push(`plus ${added} swipe${added === 1 ? "" : "s"} for this day from the other files`);
         if (dates.length > 3) notes.push(`file covers ${shortDate(dates[0])} to ${shortDate(dates[dates.length - 1])}; only the shift date is used`);
         return {
           name: g.names.join(" + "),
