@@ -1089,6 +1089,11 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
+  // One click saves a report once: the button locks while saving and stays
+  // "Saved" for that report, so a double click can't make a duplicate
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [savedResults, setSavedResults] = useState(null);
+  const saveLock = useRef(false);
   // Clearing data: a delete needs a second click, clearing every report needs
   // the word CLEAR typed, and a pending confirmation times out on its own.
   const [delPending, setDelPending] = useState(null); // report id waiting for its second click
@@ -1595,15 +1600,22 @@ export default function App() {
   };
 
   const handleSave = async () => {
+    if (saveLock.current || savedResults === results) return;
     setSaveMsg("");
     if (!uploadedBy.trim()) { setSaveMsg("Enter your name first."); return; }
     if (!supabaseReady()) { setSaveMsg("Database not configured."); return; }
     if (!results.length) { setSaveMsg("Nothing to save."); return; }
+    saveLock.current = true;
+    setSaveBusy(true);
     try {
       await saveReport(results, shiftDate, reportDate, fileName);
+      setSavedResults(results);
       setSaveMsg("Saved.");
     } catch (e) {
       setSaveMsg("Save error: " + e.message);
+    } finally {
+      saveLock.current = false;
+      setSaveBusy(false);
     }
   };
 
@@ -1611,11 +1623,14 @@ export default function App() {
   const runBulk = async () => {
     if (!uploadedBy.trim()) { setBulkFiles(f => f.map(x => x.status ? x : { ...x, status: "Enter your name first." })); return; }
     if (!supabaseReady()) { setBulkFiles(f => f.map(x => x.status ? x : { ...x, status: "Database not configured." })); return; }
+    if (saveLock.current) return;
+    saveLock.current = true;
     setBulkBusy(true);
     const nqGates = currentGates();
     const out = [];
     for (const f of bulkFiles) {
-      if (!f.rows.length || !f.shiftDate) { out.push(f); continue; }
+      // A day already saved from this screen isn't saved a second time
+      if (!f.rows.length || !f.shiftDate || f.status.startsWith("Saved")) { out.push(f); continue; }
       try {
         const res = analyze(f.rows, f.shiftDate, f.reportDate, nqGates, rules);
         await saveReport(res, f.shiftDate, f.reportDate, f.name);
@@ -1627,6 +1642,7 @@ export default function App() {
     }
     setBulkFiles(out);
     setKnownDates(k => new Set([...k, ...out.filter(f => f.status.startsWith("Saved")).map(f => f.shiftDate)]));
+    saveLock.current = false;
     setBulkBusy(false);
   };
 
@@ -1888,11 +1904,110 @@ export default function App() {
     );
   }
 
+  // ── Header on every screen ──
+  // The same bar sits at the top of every screen and stays put while the page
+  // scrolls. The four main buttons keep their places on every screen; the
+  // report's own buttons (Excel, Save, Absent) sit to their left while a day's
+  // report is open. On a phone the buttons wrap to a second row.
+  const onMain = screen === "upload" || screen === "results";
+  const goUpload = () => {
+    setMenuOpen(false);
+    setScreen("upload"); setResults([]); setFileName(""); setBulkFiles([]);
+  };
+  const openConfig = () => {
+    setMenuOpen(false);
+    if (onMain) setShowConfig(c => !c);
+    else { setScreen(results.length ? "results" : "upload"); setShowConfig(true); }
+  };
+  const dayOpen = results.length > 0 && (screen === "results" || screen === "absent");
+  const savedThis = savedResults === results && results.length > 0;
+  // Fonts, box sizing and the small screen button size, on every screen
+  const pageHeader = (<>
+    <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
+        * { box-sizing: border-box; }
+        input[type=date]::-webkit-calendar-picker-indicator { filter: invert(0.5); }
+        tr:hover td { background: rgba(59,130,246,0.04) !important; }
+        ::-webkit-scrollbar { width:5px; height:5px; }
+        ::-webkit-scrollbar-track { background:#060d16; }
+        ::-webkit-scrollbar-thumb { background:#1a2d45; border-radius:3px; }
+        @media (max-width: 480px) {
+          /* On small screens the stat cards go 4-up then 3-up naturally via flex-wrap */
+          /* Ensure filter buttons don't overflow */
+          button { font-size: 11px !important; padding: 5px 10px !important; }
+        }
+    `}</style>
+    <div data-testid="page-header" style={{
+      background:"#0a1320", borderBottom:"1px solid #1a2535",
+      padding:"8px 16px", display:"flex", flexWrap:"wrap", alignItems:"center", rowGap:8, columnGap:10,
+      justifyContent:"space-between", minHeight:52, boxSizing:"border-box", position:"sticky", top:0, zIndex:30,
+      margin: onMain ? 0 : "-20px -20px 16px",
+    }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, flexShrink:0 }}>
+        <div style={{
+          background:"linear-gradient(135deg,#1d4ed8,#0ea5e9)",
+          width:30, height:30, borderRadius:7,
+          display:"flex", alignItems:"center", justifyContent:"center",
+          fontSize:15, fontWeight:900, color:"#fff", flexShrink:0,
+        }}>G</div>
+        <div>
+          <div style={{ fontSize:13, fontWeight:700, color:"#e2e8f0", letterSpacing:0.5 }}>CP2 GATE LOG</div>
+          <div style={{ fontSize:9, color:"#4b5e7a", letterSpacing:1, textTransform:"uppercase" }}>MMR Constructors</div>
+        </div>
+      </div>
+      {/* wrap-reverse keeps the main buttons on the top line when a phone
+          screen pushes the report buttons onto a line of their own */}
+      <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap-reverse", justifyContent:"flex-end", flex:"1 1 auto" }}>
+        {dayOpen && (<div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap", justifyContent:"flex-end" }}>
+          <button onClick={handleExport} style={{
+            ...btn(true, "#1d4ed8"), background:"#1d4ed8", color:"#fff",
+          }}>↓ Excel</button>
+          <button onClick={handleSave} disabled={saveBusy || savedThis}
+            style={{ ...btn(false, "#334155"), cursor: saveBusy || savedThis ? "default" : "pointer", opacity: saveBusy || savedThis ? 0.75 : 1 }}
+            title={savedThis ? "This report is saved" : "Save to history"}>
+            {savedThis ? "✓ Saved" : saveBusy ? "Saving…" : "💾 Save"}
+          </button>
+          {roster.length > 0 && (
+            <button
+              onClick={() => setScreen("absent")}
+              style={{
+                ...btn(screen === "absent", "#334155"),
+                color: absentEmployees.length > 0 ? "#f87171" : "#4b5e7a",
+                borderColor: absentEmployees.length > 0 ? "#7f1d1d" : "#1a2d45",
+              }}
+              title="Show absent employees"
+            >🚫 Absent {absentEmployees.length > 0 ? `(${absentEmployees.length})` : ""}</button>
+          )}
+        </div>)}
+        <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap", justifyContent:"flex-end" }}>
+        <button onClick={() => { if (screen !== "weekly") loadWeekly(); }} style={btn(screen === "weekly", "#334155")}>📅 Weekly</button>
+        <button onClick={openConfig} style={btn(onMain && showConfig, "#334155")}>⚙ Config</button>
+        <button onClick={goUpload} style={btn(screen === "upload", "#334155")} title="Back to the file upload box">File Upload Box</button>
+        <div style={{ position:"relative" }}>
+          <button onClick={() => setMenuOpen(o => !o)} style={btn(false, "#334155")} aria-label="Menu">≡</button>
+          {menuOpen && (
+            <div style={{ position:"absolute", right:0, top:34, background:"#0a1320",
+              border:"1px solid #1a2535", borderRadius:8, padding:6, minWidth:200, zIndex:40 }}>
+              <div style={{ padding:"4px 6px 8px", fontSize:10, color:"#4b5e7a", lineHeight:1.5, wordBreak:"break-all" }}>
+                Signed in as<br /><span style={{ color:"#c8d6e8", fontSize:11 }}>{accountEmail}</span>
+              </div>
+              <button onClick={loadHistory} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>History</button>
+              <button onClick={loadWeekly} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>Weekly Rollup</button>
+              <button onClick={handleLogout} style={{ ...btn(false, "#334155"), width:"100%", color:"#ef4444", borderColor:"#7f1d1d" }}>Logout</button>
+            </div>
+          )}
+        </div>
+        </div>
+      </div>
+    </div>
+  </>);
+
   // ── History screen ──
   if (screen === "history") {
     return (
       <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
         fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
+        {pageHeader}
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, gap:10, flexWrap:"wrap" }}>
           <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>HISTORY</div>
           <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
@@ -1982,12 +2097,14 @@ export default function App() {
   if (screen === "bulk") {
     const savedDates = bulkFiles.filter(f => f.status.startsWith("Saved")).map(f => f.shiftDate);
     const savedCount = savedDates.length;
+    const allSaved = savedCount > 0 && bulkFiles.every(f => !f.rows.length || !f.shiftDate || f.status.startsWith("Saved"));
     const dayCount = bulkFiles.filter(f => f.shiftDate).length;
     const fileCount = bulkFiles.reduce((s, f) => s + (f.fileCount || 1), 0);
     const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
     return (
       <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
         fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
+        {pageHeader}
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 }}>
           <div>
             <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>SAVE MULTIPLE DAYS</div>
@@ -2059,13 +2176,13 @@ export default function App() {
         <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
           <button
             onClick={runBulk}
-            disabled={bulkBusy}
+            disabled={bulkBusy || allSaved}
             style={{
-              background: bulkBusy ? "#1a2d45" : "#1d4ed8", color:"#fff", border:"none",
+              background: bulkBusy || allSaved ? "#1a2d45" : "#1d4ed8", color:"#fff", border:"none",
               borderRadius:6, padding:"10px 18px", fontSize:13, fontWeight:600,
-              cursor: bulkBusy ? "default" : "pointer", fontFamily:"'DM Mono',monospace",
+              cursor: bulkBusy || allSaved ? "default" : "pointer", fontFamily:"'DM Mono',monospace",
             }}
-          >{bulkBusy ? "Saving…" : "Process & Save All"}</button>
+          >{bulkBusy ? "Saving…" : allSaved ? "✓ All Saved" : "Process & Save All"}</button>
           {savedCount > 0 && (
             <button onClick={() => openWeekAfterSave(savedDates)} disabled={bulkBusy}
               style={{ ...btn(true, "#0e7490"), background:"#0e7490", color:"#fff" }}>
@@ -2100,6 +2217,7 @@ export default function App() {
     return (
       <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
         fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
+        {pageHeader}
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 }}>
           <div>
             <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>WEEKLY ROLLUP</div>
@@ -2275,6 +2393,7 @@ export default function App() {
     return (
       <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
         fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
+        {pageHeader}
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 }}>
           <div>
             <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>ABSENT EMPLOYEES</div>
@@ -2330,64 +2449,7 @@ export default function App() {
     <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
       fontFamily:"'DM Sans','Segoe UI',sans-serif" }}>
 
-      {/* ── HEADER ── */}
-      <div style={{
-        background:"#0a1320", borderBottom:"1px solid #1a2535",
-        padding:"0 16px", display:"flex", alignItems:"center",
-        justifyContent:"space-between", height:52, position:"sticky", top:0, zIndex:10,
-      }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <div style={{
-            background:"linear-gradient(135deg,#1d4ed8,#0ea5e9)",
-            width:30, height:30, borderRadius:7,
-            display:"flex", alignItems:"center", justifyContent:"center",
-            fontSize:15, fontWeight:900, color:"#fff", flexShrink:0,
-          }}>G</div>
-          <div>
-            <div style={{ fontSize:13, fontWeight:700, color:"#e2e8f0", letterSpacing:0.5 }}>CP2 GATE LOG</div>
-            <div style={{ fontSize:9, color:"#4b5e7a", letterSpacing:1, textTransform:"uppercase" }}>MMR Constructors</div>
-          </div>
-        </div>
-        <div style={{ display:"flex", gap:6, alignItems:"center" }}>
-          <button onClick={loadWeekly} style={btn(false, "#334155")}>📅 Weekly</button>
-          <button onClick={() => setShowConfig(c => !c)} style={btn(showConfig, "#334155")}>
-            ⚙ Config
-          </button>
-          {screen === "results" && (<>
-            <button onClick={handleExport} style={{
-              ...btn(true, "#1d4ed8"), background:"#1d4ed8", color:"#fff",
-            }}>↓ Excel</button>
-            <button onClick={handleSave} style={btn(false, "#334155")} title="Save to history">💾 Save</button>
-            {roster.length > 0 && (
-              <button
-                onClick={() => setScreen("absent")}
-                style={{
-                  ...btn(false, "#334155"),
-                  color: absentEmployees.length > 0 ? "#f87171" : "#4b5e7a",
-                  borderColor: absentEmployees.length > 0 ? "#7f1d1d" : "#1a2d45",
-                }}
-                title="Show absent employees"
-              >🚫 Absent {absentEmployees.length > 0 ? `(${absentEmployees.length})` : ""}</button>
-            )}
-            <button onClick={() => { setScreen("upload"); setResults([]); setFileName(""); }}
-              style={btn(false, "#334155")}>↺</button>
-          </>)}
-          <div style={{ position:"relative" }}>
-            <button onClick={() => setMenuOpen(o => !o)} style={btn(false, "#334155")}>≡</button>
-            {menuOpen && (
-              <div style={{ position:"absolute", right:0, top:34, background:"#0a1320",
-                border:"1px solid #1a2535", borderRadius:8, padding:6, minWidth:200, zIndex:20 }}>
-                <div style={{ padding:"4px 6px 8px", fontSize:10, color:"#4b5e7a", lineHeight:1.5, wordBreak:"break-all" }}>
-                  Signed in as<br /><span style={{ color:"#c8d6e8", fontSize:11 }}>{accountEmail}</span>
-                </div>
-                <button onClick={loadHistory} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>History</button>
-                <button onClick={loadWeekly} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>Weekly Rollup</button>
-                <button onClick={handleLogout} style={{ ...btn(false, "#334155"), width:"100%", color:"#ef4444", borderColor:"#7f1d1d" }}>Logout</button>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
+      {pageHeader}
 
       {/* ── CONFIG PANEL ── */}
       {showConfig && (
@@ -2907,20 +2969,6 @@ export default function App() {
         </>)}
       </div>
 
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
-        * { box-sizing: border-box; }
-        input[type=date]::-webkit-calendar-picker-indicator { filter: invert(0.5); }
-        tr:hover td { background: rgba(59,130,246,0.04) !important; }
-        ::-webkit-scrollbar { width:5px; height:5px; }
-        ::-webkit-scrollbar-track { background:#060d16; }
-        ::-webkit-scrollbar-thumb { background:#1a2d45; border-radius:3px; }
-        @media (max-width: 480px) {
-          /* On small screens the stat cards go 4-up then 3-up naturally via flex-wrap */
-          /* Ensure filter buttons don't overflow */
-          button { font-size: 11px !important; padding: 5px 10px !important; }
-        }
-      `}</style>
     </div>
   );
 }
