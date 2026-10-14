@@ -423,7 +423,7 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAU
   return results;
 }
 
-// ── EXCEL EXPORT — iOS-safe blob download ────────────────────────────────────
+// ── EXCEL EXPORT: iOS safe blob download ────────────────────────────────────
 // XLSX.writeFile uses document.createElement('a').click() which iOS Safari blocks.
 // Instead: write to ArrayBuffer → Blob → object URL → anchor click.
 // Excel shows who made a file and with what program under File, Info. Every
@@ -516,7 +516,7 @@ function exportXLSX(results, shiftDate, reportDate, nqGates, rules = RULES_DEFAU
      `Over 13 Hrs: ${over13}`, "", "", `Total Billable Hrs: ${decToHM(totalH)}`],
     [(rules.roundTo > 0
        ? `Rounding: Raw IN and Raw OUT each rounded independently to nearest ${rules.roundTo} min via ${midpointToStr(rules.midpointSec)} midpoint rule`
-       : "Rounding: none — exact badge times used") +
+       : "Rounding: none, exact badge times used") +
      `  |  Billable = (Rounded OUT minus Rounded IN) minus ${rules.lunchMin} min lunch  |  Times displayed as H:MM` +
      (extraRulesSummary(rules) ? `  |  ${extraRulesSummary(rules)}` : "")],
     dataColHdrs,
@@ -868,7 +868,7 @@ function AreaTable({ title, rows, basis, note }) {
 
 const td = { padding:"10px 12px", color:"#c8d6e8", fontSize:13, verticalAlign:"middle" };
 
-// ── ROW — touch-safe expand ───────────────────────────────────────────────────
+// ── ROW: touch safe expand ───────────────────────────────────────────────────
 function Row({ r, idx, showRoster }) {
   const [open, setOpen] = useState(false);
   const isIssue = r.status !== "Clean";
@@ -922,7 +922,7 @@ function Row({ r, idx, showRoster }) {
         </td>
         <td style={{...td, fontFamily:"'DM Mono',monospace", fontWeight:700,
           color: r.over13 ? "#fb923c" : "#e2e8f0"}}>
-          {decToHM(r.billHrs) || "—"}
+          {decToHM(r.billHrs) || ""}
         </td>
         <td style={td}><Badge status={r.status} /></td>
       </tr>
@@ -945,8 +945,8 @@ function Row({ r, idx, showRoster }) {
                 ["Raw Elapsed",   decToHM(r.rawHrs)],
                 ["Less Lunch",    decToHM(r.lessLunch)],
                 ["Billable Hrs",  decToHM(r.billHrs)],
-                ["NQ IN (ref)",   r.nqIn  ? `${toDateStr(r.nqIn.ts)} — ${r.nqIn.gate}`   : ""],
-                ["NQ OUT (ref)",  r.nqOut ? `${toDateStr(r.nqOut.ts)} — ${r.nqOut.gate}` : ""],
+                ["NQ IN (ref)",   r.nqIn  ? `${toDateStr(r.nqIn.ts)} at ${r.nqIn.gate}`   : ""],
+                ["NQ OUT (ref)",  r.nqOut ? `${toDateStr(r.nqOut.ts)} at ${r.nqOut.gate}` : ""],
                 ...(showRoster ? [
                   ["Supervisor",  r.supervisor],
                   ["Area",        r.area],
@@ -961,7 +961,7 @@ function Row({ r, idx, showRoster }) {
                     letterSpacing:1, marginBottom:3 }}>{k}</div>
                   <div style={{ color:"#c8d6e8", fontFamily:"'DM Mono',monospace",
                     fontSize:11, wordBreak:"break-word" }}>
-                    {v || <span style={{color:"#374151"}}>—</span>}
+                    {v || <span style={{color:"#374151"}}>none</span>}
                   </div>
                 </div>
               ))}
@@ -1025,6 +1025,12 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
+  // Clearing data: a delete needs a second click, clearing every report needs
+  // the word CLEAR typed, and a pending confirmation times out on its own.
+  const [delPending, setDelPending] = useState(null); // report id waiting for its second click
+  const [clearText, setClearText]   = useState("");
+  const [clearBusy, setClearBusy]   = useState(false);
+  const [rosterClearPending, setRosterClearPending] = useState(false);
 
   // The uploader name is remembered per account on this computer and starts
   // out as the account's email address.
@@ -1042,7 +1048,7 @@ export default function App() {
 
   const [screen, setScreen]         = useState("upload");
   const [results, setResults]       = useState([]);
-  // Default to yesterday's shift, today's report — the normal morning workflow
+  // Default to yesterday's shift, today's report, the normal morning workflow
   const [shiftDate, setShiftDate]   = useState(() => toYMD(addDays(new Date(), -1)));
   const [reportDate, setReportDate] = useState(() => toYMD(new Date()));
   const [filter, setFilter]         = useState("All");
@@ -1088,6 +1094,7 @@ export default function App() {
   const [roster, setRoster]         = useState([]); // [{ein, firstName, lastName, supervisor, area, scope}]
   const [rosterMeta, setRosterMeta] = useState(null); // {uploaded_at, uploaded_by, count}
   const [rosterMsg, setRosterMsg]   = useState("");
+  const rosterMsgBad = /^(Upload error|Clear error|Enter|Database)/.test(rosterMsg);
   const rosterFileRef = useRef();
   const rosterFileRef2 = useRef();
 
@@ -1180,7 +1187,7 @@ export default function App() {
           knownGates: byKey.known_gates && Array.isArray(byKey.known_gates.value)
             ? byKey.known_gates.value : seenGates,
         }));
-      } catch (_) { /* silent — defaults still apply */ }
+      } catch (_) { /* silent, defaults still apply */ }
     })();
   }, [appOpen]);
 
@@ -1200,7 +1207,7 @@ export default function App() {
     const knownUnion = [...new Set([...seenGates, ...gates])].sort();
     setSeenGates(knownUnion);
     localStorage.setItem("cp2-config", JSON.stringify({ nqGates: gates, rules: cleanRules, knownGates: knownUnion }));
-    if (!supabaseReady()) { setCfgMsg("Saved on this device only — database not configured."); return; }
+    if (!supabaseReady()) { setCfgMsg("Saved on this device only, database not configured."); return; }
     try {
       const by = uploadedBy.trim() || "unknown";
       const now = new Date().toISOString();
@@ -1211,7 +1218,7 @@ export default function App() {
       ]);
       if (error) throw error;
       setCfgMeta({ updated_by: by, updated_at: now });
-      setCfgMsg("Config saved — applies for everyone.");
+      setCfgMsg("Config saved, applies for everyone.");
     } catch (e) {
       setCfgMsg("Config save error: " + e.message);
     }
@@ -1481,7 +1488,7 @@ export default function App() {
 
   // ── Supabase save / load handlers ──
   // Writes the columns that actually exist in the reports table
-  // (the old build wrote shifts_count/issues_count, which don't — every save failed).
+  // (the old build wrote shifts_count/issues_count, which don't, so every save failed).
   const saveReport = async (res, sDate, rDate, fname) => {
     const totalBillHrs = res.reduce((s, r) => s + (r.billHrs || 0), 0);
     const { error } = await supabase.from("reports").insert({
@@ -1527,7 +1534,7 @@ export default function App() {
       try {
         const res = analyze(f.rows, f.shiftDate, f.reportDate, nqGates, rules);
         await saveReport(res, f.shiftDate, f.reportDate, f.name);
-        out.push({ ...f, status: `Saved — ${res.length} workers, ${decToHM(res.reduce((s, r) => s + (r.billHrs || 0), 0))} hrs` });
+        out.push({ ...f, status: `Saved: ${res.length} workers, ${decToHM(res.reduce((s, r) => s + (r.billHrs || 0), 0))} hrs` });
       } catch (e) {
         out.push({ ...f, status: "Save error: " + e.message });
       }
@@ -1549,11 +1556,84 @@ export default function App() {
       .limit(100);
     if (error) { setSaveMsg("History error: " + error.message); return; }
     setHistory(data || []);
+    setDelPending(null);
+    setClearText("");
     setScreen("history");
     setMenuOpen(false);
   };
 
-  // Saved results have their Date fields serialized to strings — revive them
+  // ── Clear data ──
+  // Deletes run under the database's row policies for signed in team members.
+  // A count of 0 means the database removed nothing, so nothing comes off the
+  // screen either and the message says so.
+  const refreshKnownDates = async () => {
+    const { data } = await supabase.from("reports").select("shift_date");
+    if (data) setKnownDates(new Set(data.map(r => r.shift_date)));
+  };
+
+  const deleteReport = async (id) => {
+    setSaveMsg("");
+    if (!supabaseReady()) { setSaveMsg("Database not configured."); return; }
+    setClearBusy(true);
+    try {
+      const { error, count } = await supabase.from("reports").delete({ count: "exact" }).eq("id", id);
+      if (error) throw error;
+      if (!count) throw new Error("the database did not allow the delete");
+      setHistory(h => h.filter(r => r.id !== id));
+      setWeeklyReports(w => w.filter(r => r.id !== id));
+      setSelIds(s => { const next = new Set(s); next.delete(id); return next; });
+      setRollup(null);
+      setSaveMsg("Report deleted.");
+      refreshKnownDates();
+    } catch (e) {
+      setSaveMsg("Delete error: " + e.message);
+    } finally {
+      setDelPending(null);
+      setClearBusy(false);
+    }
+  };
+
+  const clearAllReports = async () => {
+    setSaveMsg("");
+    if (!supabaseReady()) { setSaveMsg("Database not configured."); return; }
+    setClearBusy(true);
+    try {
+      const { error, count } = await supabase.from("reports").delete({ count: "exact" }).not("id", "is", null);
+      if (error) throw error;
+      setHistory([]); setWeeklyReports([]); setSelIds(new Set()); setRollup(null); setKnownDates(new Set());
+      setSaveMsg(`Cleared ${count || 0} saved report${count === 1 ? "" : "s"}.`);
+    } catch (e) {
+      setSaveMsg("Clear error: " + e.message);
+    } finally {
+      setClearText("");
+      setClearBusy(false);
+    }
+  };
+
+  const clearRoster = async () => {
+    setRosterMsg("");
+    if (!supabaseReady()) { setRosterMsg("Database not configured."); setRosterClearPending(false); return; }
+    try {
+      const { error, count } = await supabase.from("employees").delete({ count: "exact" }).neq("ein", "___never___");
+      if (error) throw error;
+      setRoster([]);
+      setRosterMeta(null);
+      setRosterMsg(`Roster cleared, ${count || 0} employee${count === 1 ? "" : "s"} removed.`);
+    } catch (e) {
+      setRosterMsg("Clear error: " + e.message);
+    } finally {
+      setRosterClearPending(false);
+    }
+  };
+
+  // A confirmation that is not acted on goes back to normal after a few seconds
+  useEffect(() => {
+    if (delPending == null && !rosterClearPending) return;
+    const t = setTimeout(() => { setDelPending(null); setRosterClearPending(false); }, 8000);
+    return () => clearTimeout(t);
+  }, [delPending, rosterClearPending]);
+
+  // Saved results have their Date fields serialized to strings, so revive them
   const reviveResults = (list) => (list || []).map(r => ({
     ...r,
     rawIn:  r.rawIn  ? new Date(r.rawIn)  : null,
@@ -1696,9 +1776,30 @@ export default function App() {
     return (
       <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
         fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, gap:10, flexWrap:"wrap" }}>
           <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>HISTORY</div>
-          <button onClick={() => setScreen(results.length ? "results" : "upload")} style={btn(false, "#334155")}>Back</button>
+          <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+            {history.length > 0 && (() => {
+              const armed = clearText.trim().toUpperCase() === "CLEAR" && !clearBusy;
+              return (<>
+                <input
+                  value={clearText}
+                  onChange={e => setClearText(e.target.value)}
+                  placeholder="type CLEAR to enable"
+                  aria-label="Type CLEAR to enable clearing every saved report"
+                  style={{ ...inp, width:170, padding:"6px 10px", fontSize:12 }}
+                />
+                <button
+                  onClick={clearAllReports}
+                  disabled={!armed}
+                  title="Removes every saved report for the whole team"
+                  style={{ ...btn(armed, "#b91c1c"), color: armed ? "#fff" : "#4b5e7a",
+                    cursor: armed ? "pointer" : "default", opacity: armed ? 1 : 0.7 }}
+                >Clear all saved reports</button>
+              </>);
+            })()}
+            <button onClick={() => setScreen(results.length ? "results" : "upload")} style={btn(false, "#334155")}>Back</button>
+          </div>
         </div>
         <div style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden" }}>
           {history.length === 0 ? (
@@ -1729,8 +1830,17 @@ export default function App() {
                       <td style={{ padding:"9px 12px", fontSize:12 }}>{h.total_workers}</td>
                       <td style={{ padding:"9px 12px", fontSize:12 }}>{(h.total_workers || 0) - (h.clean_count || 0)}</td>
                       <td style={{ padding:"9px 12px", fontSize:12 }}>{decToHM(Number(h.total_bill_hrs) || 0)}</td>
-                      <td style={{ padding:"9px 12px" }}>
+                      <td style={{ padding:"9px 12px", whiteSpace:"nowrap" }}>
                         <button onClick={() => loadReport(h.id)} style={btn(false, "#334155")}>Load</button>
+                        {delPending === h.id ? (<>
+                          <button onClick={() => deleteReport(h.id)} disabled={clearBusy}
+                            style={{ ...btn(true, "#b91c1c"), marginLeft:6 }}>Confirm delete</button>
+                          <button onClick={() => setDelPending(null)}
+                            style={{ ...btn(false, "#334155"), marginLeft:6 }}>Keep</button>
+                        </>) : (
+                          <button onClick={() => setDelPending(h.id)} title="Remove this saved report"
+                            style={{ ...btn(false, "#334155"), marginLeft:6, color:"#ef4444", borderColor:"#7f1d1d" }}>Delete</button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -1739,7 +1849,14 @@ export default function App() {
             </div>
           )}
         </div>
-        {saveMsg && <div style={{ marginTop:12, fontSize:12, color:"#4b5e7a" }}>{saveMsg}</div>}
+        {saveMsg && (
+          <div style={{ marginTop:12, fontSize:12, fontFamily:"'DM Mono',monospace",
+            color: /error/i.test(saveMsg) ? "#f87171" : "#34d399" }}>{saveMsg}</div>
+        )}
+        <div style={{ marginTop:10, fontSize:11, color:"#4b5e7a", lineHeight:1.5 }}>
+          Delete removes a saved report for the whole team. A deleted day can be saved again by uploading its file.
+          Clear all removes every saved report, including days not shown in this list.
+        </div>
       </div>
     );
   }
@@ -1754,7 +1871,7 @@ export default function App() {
           <div>
             <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>SAVE MULTIPLE DAYS</div>
             <div style={{ fontSize:11, color:"#4b5e7a", marginTop:2 }}>
-              {bulkFiles.length} file(s) · shift dates auto-detected — adjust before saving
+              {bulkFiles.length} file(s) · shift dates auto detected, adjust before saving
             </div>
           </div>
           <button onClick={() => { setScreen("upload"); setBulkFiles([]); }} style={btn(false, "#334155")}>Back</button>
@@ -1797,7 +1914,7 @@ export default function App() {
                           : x))}
                         style={{ ...inp, width:150 }} />
                       {knownDates.has(f.shiftDate) && !f.status.startsWith("Saved") && (
-                        <div style={{ color:"#fb923c", fontSize:10, marginTop:3 }}>⚠ already in database — saving again creates a duplicate</div>
+                        <div style={{ color:"#fb923c", fontSize:10, marginTop:3 }}>⚠ already in database, saving again creates a duplicate</div>
                       )}
                     </td>
                     <td style={{ padding:"9px 12px" }}>
@@ -1891,7 +2008,7 @@ export default function App() {
         {dupSelected && (
           <div style={{ background:"#3b2500", border:"1px solid #9a3412", color:"#fb923c",
             padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10 }}>
-            ⚠ Two reports with the same shift date are selected — the later-saved one counts for that day.
+            ⚠ Two reports with the same shift date are selected. The later saved one counts for that day.
           </div>
         )}
 
@@ -1923,7 +2040,7 @@ export default function App() {
                       </td>
                       <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace" }}>{r.shift_date}</td>
                       <td style={{ padding:"9px 12px", fontSize:11, fontFamily:"'DM Mono',monospace",
-                        color:"#6b7a8d", wordBreak:"break-all" }}>{r.file_name || "—"}</td>
+                        color:"#6b7a8d", wordBreak:"break-all" }}>{r.file_name || ""}</td>
                       <td style={{ padding:"9px 12px", fontSize:12 }}>{r.uploaded_by}</td>
                       <td style={{ padding:"9px 12px", fontSize:12 }}>{r.total_workers}</td>
                       <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace" }}>
@@ -2003,7 +2120,7 @@ export default function App() {
                         return (
                           <td key={d} style={{ ...td, fontFamily:"'DM Mono',monospace", fontSize:12,
                             color: !day ? "#374151" : day.billHrs == null ? "#ef4444" : day.over13 ? "#fb923c" : "#c8d6e8" }}>
-                            {!day ? "—" : day.billHrs == null ? "MISS" : decToHM(day.billHrs)}
+                            {!day ? "" : day.billHrs == null ? "MISS" : decToHM(day.billHrs)}
                           </td>
                         );
                       })}
@@ -2316,7 +2433,7 @@ export default function App() {
               </div>
             </div>
             <div style={{ fontSize:10, color:"#4b5e7a", marginTop:6, fontFamily:"'DM Mono',monospace" }}>
-              Current rule: {rulesSummary(rules)} · lunch {rules.lunchMin} min.{extraRulesSummary(rules) && ` ${extraRulesSummary(rules)}.`} Applies to new uploads — saved reports keep the numbers they were saved with.
+              Current rule: {rulesSummary(rules)} · lunch {rules.lunchMin} min.{extraRulesSummary(rules) && ` ${extraRulesSummary(rules)}.`} Applies to new uploads. Saved reports keep the numbers they were saved with.
             </div>
           </div>
 
@@ -2350,6 +2467,7 @@ export default function App() {
               fontFamily:"'DM Mono',monospace", lineHeight:1.5 }}>
               Columns: EIN (required), Area, Supervisor (can be blank), First Name, Last Name.
               A new upload replaces the previous roster. Upload the roster and it switches to the roster's work areas.
+              Clear Roster removes the roster for the whole team.
             </div>
             <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
               <input
@@ -2372,6 +2490,13 @@ export default function App() {
                   cursor:"pointer", fontFamily:"'DM Mono',monospace",
                 }}
               >📤 Upload Roster</button>
+              {roster.length > 0 && (rosterClearPending ? (<>
+                <button onClick={clearRoster} style={btn(true, "#b91c1c")}>Confirm clear roster</button>
+                <button onClick={() => setRosterClearPending(false)} style={btn(false, "#334155")}>Keep</button>
+              </>) : (
+                <button onClick={() => setRosterClearPending(true)} title="Remove the roster for the whole team"
+                  style={{ ...btn(false, "#334155"), color:"#ef4444", borderColor:"#7f1d1d" }}>Clear Roster</button>
+              ))}
               {rosterMeta && (
                 <div style={{ fontSize:11, color:"#4b5e7a", fontFamily:"'DM Mono',monospace" }}>
                   {rosterMeta.count} employees · last by {rosterMeta.uploaded_by} · {new Date(rosterMeta.uploaded_at).toLocaleString()}
@@ -2381,7 +2506,7 @@ export default function App() {
             {rosterMsg && (
               <div style={{
                 marginTop:8, fontSize:12,
-                color: rosterMsg.startsWith("Upload error") || rosterMsg.startsWith("Enter") || rosterMsg.startsWith("Database") ? "#f87171" : "#34d399",
+                color: rosterMsgBad ? "#f87171" : "#34d399",
                 fontFamily:"'DM Mono',monospace",
               }}>{rosterMsg}</div>
             )}
@@ -2499,10 +2624,17 @@ export default function App() {
                   style={{ ...btn(true, "#1d4ed8"), background:"#1d4ed8", color:"#fff" }}>↑ Upload Roster</button>
                 <input ref={rosterFileRef2} data-testid="roster-file" type="file" accept=".xlsx,.xls,.csv" style={{ display:"none" }}
                   onChange={e => { handleRosterUpload(e.target.files[0]); e.target.value = ""; }} />
+                {roster.length > 0 && (rosterClearPending ? (<>
+                  <button onClick={clearRoster} style={btn(true, "#b91c1c")}>Confirm clear roster</button>
+                  <button onClick={() => setRosterClearPending(false)} style={btn(false, "#334155")}>Keep</button>
+                </>) : (
+                  <button onClick={() => setRosterClearPending(true)} title="Remove the roster for the whole team"
+                    style={{ ...btn(false, "#334155"), color:"#ef4444", borderColor:"#7f1d1d" }}>Clear Roster</button>
+                ))}
               </div>
               {rosterMsg && (
                 <div style={{ marginTop:8, fontSize:12, fontFamily:"'DM Mono',monospace",
-                  color: rosterMsg.startsWith("Upload error") || rosterMsg.startsWith("Enter") || rosterMsg.startsWith("Database") ? "#f87171" : "#34d399" }}>
+                  color: rosterMsgBad ? "#f87171" : "#34d399" }}>
                   {rosterMsg}
                 </div>
               )}
@@ -2521,7 +2653,7 @@ export default function App() {
             }}>{saveMsg}</div>
           )}
 
-          {/* STAT CARDS — 4-per-row on mobile, flex-wrap */}
+          {/* STAT CARDS: 4 per row on mobile, flex wrap */}
           <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
             <StatCard label="Workers"      value={results.length}  color="#3b82f6" />
             <StatCard label="Clean"        value={clean}           color="#22c55e" />
@@ -2534,7 +2666,7 @@ export default function App() {
 
           <AreaTable title="ISSUES BY AREA" rows={dailyAreaRows} basis={areaBasis} />
 
-          {/* FILTERS — wrap naturally; search on its own row on mobile */}
+          {/* FILTERS: wrap naturally; search on its own row on mobile */}
           <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10, alignItems:"center" }}>
             {["All","Issues","Missing OUT","Missing IN","Over 13"].map(f => (
               <button key={f} onClick={() => setFilter(f)} style={btn(filter===f,"#1d4ed8")}>{f}</button>
@@ -2551,7 +2683,7 @@ export default function App() {
             )}
           </div>
 
-          {/* Supervisor / Area / Scope filters — only show when roster loaded */}
+          {/* Supervisor / Area / Scope filters: only show when roster loaded */}
           {roster.length > 0 && (
             <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10, alignItems:"center" }}>
               <select
@@ -2611,7 +2743,7 @@ export default function App() {
           <div style={{ fontSize:10, color:"#4b5e7a", marginBottom:10,
             fontFamily:"'DM Mono',monospace", lineHeight:1.6 }}>
             Shift: {shiftDate} &nbsp;|&nbsp; Report: {reportDate}<br/>
-            Showing {filtered.length} of {results.length} workers — tap row to expand
+            Showing {filtered.length} of {results.length} workers, tap a row to expand
           </div>
 
           {/* TABLE */}
