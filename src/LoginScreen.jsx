@@ -629,7 +629,7 @@ function AccountForms({ initialNotice }) {
           aria-invalid={error.field === "code" ? "true" : "false"}
           aria-describedby={["lg-code-hint", error.field === "code" ? "lg-error" : null].filter(Boolean).join(" ")}
         />
-        <div id="lg-code-hint" className="lg-hint">Only the newest code works. If nothing arrives within a few minutes, check your junk or spam folder.</div>
+        <div id="lg-code-hint" className="lg-hint">The email can take up to 10 minutes. A new code cancels the last one, so wait for it before sending another. Check junk or spam too.</div>
         <ErrorLine text={error.text} />
         <button type="submit" className="lg-submit" disabled={busy}>
           {busy ? "Checking…" : "Continue"}

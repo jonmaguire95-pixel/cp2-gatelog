@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
 import { supabase, supabaseReady, authStart, writePasswordStep, takeCodeIntent } from "./supabase.js";
 import LoginScreen from "./LoginScreen.jsx";
+import { filesFromZip } from "./unzip.js";
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const NQ_GATES_DEFAULT = new Set([
@@ -219,6 +220,48 @@ async function readGateFile(file) {
   return parseWorkbook(await file.arrayBuffer());
 }
 
+// A week of exports can come as one .zip. The Genetec files inside it are
+// pulled out and handled exactly like files dropped on their own. Anything
+// wrong with a zip stops the whole drop, so a day can't go missing quietly.
+const ZIP_RE = /\.zip$/i;
+
+function zipMessage(name, e) {
+  const fix = "Unzip it and drop the files instead.";
+  switch (e && e.code) {
+    case "browser": return `This browser can't open .zip files. ${fix}`;
+    case "locked":  return `${name} is password protected. ${fix}`;
+    case "method":  return `${name} uses a compression type the site can't read. ${fix}`;
+    case "toobig":  return `${name} is too large to open here. ${fix}`;
+    default:        return `${name} couldn't be opened. It may be damaged or not a real zip. ${fix}`;
+  }
+}
+
+async function expandZips(files) {
+  const out = [];
+  for (const f of files) {
+    if (!ZIP_RE.test(f.name)) { out.push(f); continue; }
+    let inner;
+    try { inner = await filesFromZip(f, GATE_FILE_RE); }
+    catch (e) { throw new Error(zipMessage(f.name, e)); }
+    if (!inner.length) throw new Error(`No Genetec files (.xlsx or .csv) found in ${f.name}.`);
+    out.push(...inner);
+  }
+  return out;
+}
+
+// A Genetec raw export has a cardholder and a timestamp on every swipe.
+// Anything else (a saved Gate Log report, a roster) is turned away so it
+// can't become an empty or made up day.
+function swipeCount(rows) {
+  let n = 0;
+  for (const r of rows) {
+    if ((r["CardholderGuid"] || r["Cardholder Guid"] || r["cardholderguid"]) &&
+        parseDate(r["Event Timestamp"] || r["EventTimestamp"] || "")) n++;
+  }
+  return n;
+}
+const NO_SWIPES = "No badge swipes found. Use the Genetec raw export.";
+
 // Exports of the same day overlap (the .2 file is usually a later, longer pull
 // of the first one). Identical swipes are kept once.
 function mergeRows(lists) {
@@ -250,6 +293,27 @@ function rowDates(rows) {
 }
 
 const shortDate = ymd => `${Number(ymd.slice(5, 7))}/${Number(ymd.slice(8, 10))}`;
+const dayLabel = ymd => `${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(ymd + "T00:00:00").getDay()]} ${shortDate(ymd)}`;
+
+// The weekly rollup runs Monday to Sunday by shift date. weekStart gives the
+// Monday of the week a shift date falls in, weekDays the seven dates.
+const weekStart = ymd => {
+  const d = new Date(ymd + "T00:00:00");
+  return toYMD(addDays(d, -((d.getDay() + 6) % 7)));
+};
+const weekDays = mon => [...Array(7)].map((_, i) => toYMD(addDays(new Date(mon + "T00:00:00"), i)));
+
+// One saved report per shift date among `days`, the most recently saved, so a
+// day that was saved twice is only picked once
+function newestPerDate(reports, days) {
+  const best = {};
+  for (const r of reports) {
+    if (!days.includes(r.shift_date)) continue;
+    const b = best[r.shift_date];
+    if (!b || String(r.uploaded_at || "") > String(b.uploaded_at || "")) best[r.shift_date] = r;
+  }
+  return Object.values(best);
+}
 
 // ── MAIN ANALYSIS ─────────────────────────────────────────────────────────────
 function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAULT) {
@@ -1080,6 +1144,7 @@ export default function App() {
   const [bulkFiles, setBulkFiles]   = useState([]); // [{name, rows, shiftDate, reportDate, status}]
   const [bulkBusy, setBulkBusy]     = useState(false);
   const [knownDates, setKnownDates] = useState(new Set()); // shift_dates already saved in DB
+  const [bulkFrom, setBulkFrom]     = useState("");        // zip name(s) the files came from
 
   // ── Weekly rollup state ──
   const [weeklyReports, setWeeklyReports] = useState([]); // report metadata rows
@@ -1087,6 +1152,7 @@ export default function App() {
   const [rollup, setRollup]         = useState(null); // {emps, dates}
   const [rollupMeta, setRollupMeta] = useState([]);   // day meta for selected reports
   const [weeklyMsg, setWeeklyMsg]   = useState("");
+  const [weeklyNote, setWeeklyNote] = useState("");   // which week opened after a save
   const [weeklySearch, setWeeklySearch] = useState("");
   const [weeklyBusy, setWeeklyBusy] = useState(false);
 
@@ -1311,6 +1377,7 @@ export default function App() {
     try {
       const rows = await readGateFile(file);
       if (!rows.length) throw new Error("No data rows found in the file.");
+      if (!swipeCount(rows)) throw new Error(NO_SWIPES);
       mergeSeenGates(rows.map(r => r["Area"]));
       const nqGates = currentGates();
       // Keep the chosen shift date when the file covers that day's afternoon.
@@ -1334,21 +1401,24 @@ export default function App() {
 
   // Multiple files → bulk screen. Each file's shift date is detected; files
   // for the same shift date are combined with duplicate swipes removed, then
-  // every day is saved to the database in one pass.
-  const prepareBulk = useCallback((files) => {
+  // every day is saved to the database in one pass. `from` names the zip(s)
+  // the files came out of, if any.
+  const prepareBulk = useCallback((files, from = "") => {
     setError("");
     setProcessing(true);
+    setBulkFrom(from);
     const nqGates = currentGates();
     Promise.all([...files].map(f =>
       readGateFile(f)
-        .then(rows => ({ name: f.name, rows, problem: rows.length ? "" : "No data rows" }))
+        .then(rows => ({ name: f.name, rows,
+          problem: !rows.length ? "No data rows" : !swipeCount(rows) ? NO_SWIPES : "" }))
         .catch(err => ({ name: f.name, rows: [], problem: "Read error: " + err.message }))
     )).then(read => {
       const groups = {};
       const problems = [];
       for (const f of read) {
         if (f.problem) {
-          problems.push({ name: f.name, rows: [], shiftDate: "", reportDate: "", note: "", status: f.problem });
+          problems.push({ name: f.name, rows: [], shiftDate: "", reportDate: "", note: "", status: f.problem, fileCount: 1 });
           continue;
         }
         mergeSeenGates(f.rows.map(r => r["Area"]));
@@ -1370,6 +1440,7 @@ export default function App() {
           reportDate: toYMD(addDays(new Date(sd + "T00:00:00"), 1)),
           note: notes.join(". "),
           status: "",
+          fileCount: g.names.length,
         };
       });
       const all = [...prepared, ...problems]
@@ -1386,14 +1457,28 @@ export default function App() {
     }
   }, [nqText, mergeSeenGates]);
 
-  const handleFiles = useCallback((fileList) => {
-    const files = [...(fileList || [])].filter(f => f && GATE_FILE_RE.test(f.name));
+  const handleFiles = useCallback(async (fileList) => {
+    // Copy the list right away: the browser empties it once the event is over
+    const dropped = [...(fileList || [])].filter(Boolean);
+    let files = dropped.filter(f => GATE_FILE_RE.test(f.name) || ZIP_RE.test(f.name));
     if (!files.length) {
-      if (fileList && fileList.length) setError("Use the Genetec export: an .xlsx or .csv file.");
+      if (dropped.length) setError("Use the Genetec export: .xlsx or .csv files, or a .zip of them.");
       return;
     }
+    const zips = files.filter(f => ZIP_RE.test(f.name)).map(f => f.name);
+    if (zips.length) {
+      setError("");
+      setProcessing(true);
+      try {
+        files = await expandZips(files);
+      } catch (e) {
+        setError(e.message);
+        setProcessing(false);
+        return;
+      }
+    }
     if (files.length === 1) processFile(files[0]);
-    else prepareBulk(files);
+    else prepareBulk(files, zips.join(", "));
   }, [processFile, prepareBulk]);
 
   const onDrop = useCallback(e => {
@@ -1660,10 +1745,13 @@ export default function App() {
   };
 
   // ── Weekly rollup handlers ──
+  // Loads the saved report list and opens the weekly screen. Returns the list
+  // so a caller can pick days from it straight away.
   const loadWeekly = async () => {
     setWeeklyMsg("");
+    setWeeklyNote("");
     setMenuOpen(false);
-    if (!supabaseReady()) { setWeeklyMsg("Database not configured."); setScreen("weekly"); return; }
+    if (!supabaseReady()) { setWeeklyMsg("Database not configured."); setScreen("weekly"); return []; }
     const { data, error } = await supabase
       .from("reports")
       .select(reportListSelect)
@@ -1673,6 +1761,7 @@ export default function App() {
     setWeeklyReports(data || []);
     setRollup(null);
     setScreen("weekly");
+    return data || [];
   };
 
   const toggleSel = (id) => {
@@ -1682,30 +1771,59 @@ export default function App() {
       return next;
     });
     setRollup(null);
+    setWeeklyNote("");
   };
 
-  // Quick-select a Monday–Sunday week: 0 = this week, -1 = last week
+  // Quick select a Monday to Sunday week: 0 = this week, -1 = last week
   const selectWeek = (offset) => {
-    const today = new Date();
-    const dow = (today.getDay() + 6) % 7; // Monday = 0
-    const mon = addDays(today, -dow + offset * 7);
-    const dates = new Set([...Array(7)].map((_, i) => toYMD(addDays(mon, i))));
-    setSelIds(new Set(weeklyReports.filter(r => dates.has(r.shift_date)).map(r => r.id)));
+    const days = weekDays(toYMD(addDays(new Date(weekStart(toYMD(new Date())) + "T00:00:00"), offset * 7)));
+    setSelIds(new Set(newestPerDate(weeklyReports, days).map(r => r.id)));
     setRollup(null);
+    setWeeklyNote("");
   };
 
-  const buildRollup = async () => {
+  // After a bulk save: open the rollup on the Monday to Sunday week (by shift
+  // date) holding most of the days just saved, with the newest saved report
+  // for each day of that week picked, and build it. Saved days that belong to
+  // another week, and days of this week with nothing saved, are named on
+  // screen so nothing drops out without notice.
+  const openWeekAfterSave = async (savedDates) => {
+    const reports = await loadWeekly();
+    if (!savedDates.length || !reports.length) return;
+    const count = {};
+    for (const d of savedDates) { const m = weekStart(d); count[m] = (count[m] || 0) + 1; }
+    const mon = Object.keys(count).sort((a, b) => count[b] - count[a] || b.localeCompare(a))[0];
+    const days = weekDays(mon);
+    const inWeek = newestPerDate(reports, days);
+    const ids = new Set(inWeek.map(r => r.id));
+    setSelIds(ids);
+    const have = new Set(inWeek.map(r => r.shift_date));
+    const missing = days.filter(d => !have.has(d));
+    const other = [...new Set(savedDates.filter(d => !days.includes(d)))].sort();
+    const notes = [`Week of ${dayLabel(days[0])} to ${dayLabel(days[6])}.`];
+    if (missing.length) notes.push(`Not saved yet: ${missing.map(dayLabel).join(", ")}.`);
+    if (other.length) notes.push(`Also saved, in another week: ${other.map(dayLabel).join(", ")}.`);
+    setWeeklyNote(notes.join(" "));
+    await buildRollupFor(ids, reports);
+  };
+
+  const buildRollup = () => buildRollupFor(selIds, weeklyReports);
+
+  const buildRollupFor = async (ids, reports) => {
     setWeeklyMsg("");
-    const chosen = weeklyReports.filter(r => selIds.has(r.id));
+    const chosen = reports.filter(r => ids.has(r.id));
     if (!chosen.length) { setWeeklyMsg("Select at least one day first."); return; }
     setWeeklyBusy(true);
     try {
       const { data, error } = await supabase
         .from("reports")
-        .select("id, shift_date, results_json")
-        .in("id", [...selIds]);
+        .select("id, shift_date, uploaded_at, results_json")
+        .in("id", [...ids]);
       if (error) throw error;
-      const sorted = (data || []).slice().sort((a, b) => a.shift_date.localeCompare(b.shift_date));
+      // By shift date, then by save time, so when two reports for the same
+      // date are picked the later saved one counts for that day
+      const sorted = (data || []).slice().sort((a, b) =>
+        a.shift_date.localeCompare(b.shift_date) || String(a.uploaded_at || "").localeCompare(String(b.uploaded_at || "")));
       const byEmp = {};
       const dates = [...new Set(sorted.map(r => r.shift_date))].sort();
       for (const rep of sorted) {
@@ -1716,7 +1834,6 @@ export default function App() {
             name: r.name || "", company: r.company || "", ein: r.ein || "",
             days: {}, daysWorked: 0, issueDays: 0, total: 0,
           });
-          // Same date in two selected reports: the later-saved report wins
           e.days[rep.shift_date] = { billHrs: r.billHrs, status: r.status, over13: r.over13, flagArea: gateFlagArea(r) };
         }
       }
@@ -1863,15 +1980,19 @@ export default function App() {
 
   // ── Bulk upload screen (multiple daily CSVs → database) ──
   if (screen === "bulk") {
-    const savedCount = bulkFiles.filter(f => f.status.startsWith("Saved")).length;
+    const savedDates = bulkFiles.filter(f => f.status.startsWith("Saved")).map(f => f.shiftDate);
+    const savedCount = savedDates.length;
+    const dayCount = bulkFiles.filter(f => f.shiftDate).length;
+    const fileCount = bulkFiles.reduce((s, f) => s + (f.fileCount || 1), 0);
+    const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
     return (
       <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
         fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 }}>
           <div>
             <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>SAVE MULTIPLE DAYS</div>
-            <div style={{ fontSize:11, color:"#4b5e7a", marginTop:2 }}>
-              {bulkFiles.length} file(s) · shift dates auto detected, adjust before saving
+            <div data-testid="bulk-summary" style={{ fontSize:11, color:"#4b5e7a", marginTop:2, wordBreak:"break-word" }}>
+              {plural(dayCount, "day")} from {plural(fileCount, "file")}{bulkFrom ? ` in ${bulkFrom}` : ""} · shift dates come from the swipe data, check them before saving
             </div>
           </div>
           <button onClick={() => { setScreen("upload"); setBulkFiles([]); }} style={btn(false, "#334155")}>Back</button>
@@ -1946,7 +2067,8 @@ export default function App() {
             }}
           >{bulkBusy ? "Saving…" : "Process & Save All"}</button>
           {savedCount > 0 && (
-            <button onClick={loadWeekly} style={{ ...btn(true, "#0e7490"), background:"#0e7490", color:"#fff" }}>
+            <button onClick={() => openWeekAfterSave(savedDates)} disabled={bulkBusy}
+              style={{ ...btn(true, "#0e7490"), background:"#0e7490", color:"#fff" }}>
               📅 Go to Weekly Rollup →
             </button>
           )}
@@ -1992,13 +2114,17 @@ export default function App() {
           <div style={{ background:"#3f1d1d", border:"1px solid #7f1d1d", color:"#e2e8f0",
             padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10 }}>{weeklyMsg}</div>
         )}
+        {weeklyNote && (
+          <div data-testid="weekly-note" style={{ background:"#0d1520", border:"1px solid #1a2d45", color:"#c8d6e8",
+            padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10, lineHeight:1.5 }}>{weeklyNote}</div>
+        )}
 
         {/* Day picker */}
         <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10, alignItems:"center" }}>
           <button onClick={() => selectWeek(0)}  style={btn(false, "#1d4ed8")}>This Week</button>
           <button onClick={() => selectWeek(-1)} style={btn(false, "#1d4ed8")}>Last Week</button>
           {selIds.size > 0 && (
-            <button onClick={() => { setSelIds(new Set()); setRollup(null); }} style={btn(false, "#334155")}>Clear</button>
+            <button onClick={() => { setSelIds(new Set()); setRollup(null); setWeeklyNote(""); }} style={btn(false, "#334155")}>Clear</button>
           )}
           <span style={{ fontSize:11, color:"#4b5e7a", fontFamily:"'DM Mono',monospace" }}>
             {selIds.size} day(s) selected
@@ -2589,10 +2715,11 @@ export default function App() {
                 {processing ? "Processing…" : fileName || "Tap to browse or drop Genetec files"}
               </div>
               <div style={{ fontSize:11, color:"#4b5e7a", marginTop:4, lineHeight:1.5 }}>
-                Genetec raw export (.xlsx or .csv). Drop several days at once to save them all;
-                two files for the same day are combined automatically.
+                Genetec raw export (.xlsx or .csv), or a .zip of a week's files. Drop several days
+                at once to save them all; two files for the same day are combined automatically.
               </div>
-              <input ref={fileRef} data-testid="gate-files" type="file" accept=".xlsx,.xls,.xlsm,.csv" multiple style={{display:"none"}}
+              <input ref={fileRef} data-testid="gate-files" type="file"
+                accept=".xlsx,.xls,.xlsm,.csv,.zip,application/zip,application/x-zip-compressed" multiple style={{display:"none"}}
                 onChange={e => { handleFiles(e.target.files); e.target.value = ""; }} />
             </div>
 
