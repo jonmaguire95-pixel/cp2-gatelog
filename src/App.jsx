@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
-import { supabase, supabaseReady, SHARED_PASSWORD } from "./supabase.js";
+import { supabase, supabaseReady, authStart, writePasswordStep } from "./supabase.js";
+import LoginScreen from "./LoginScreen.jsx";
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const NQ_GATES_DEFAULT = new Set([
@@ -94,9 +95,34 @@ function addDays(d, n) {
   return r;
 }
 
-// Detect the shift date of a raw CSV: the most common calendar date among
-// qualifying IN events (falls back to all events if none qualify).
+// Days with badge activity from 3:00 PM on, with a count of swipes for each
+function afternoonCounts(rows) {
+  const counts = {};
+  for (const r of rows) {
+    const ts = parseDate(r["Event Timestamp"] || r["EventTimestamp"] || "");
+    if (ts && ts.getHours() >= 15) {
+      const d = toYMD(ts);
+      counts[d] = (counts[d] || 0) + 1;
+    }
+  }
+  return counts;
+}
+
+// Detect the shift date of a raw export from the data itself, never the file
+// name. A pull runs from the shift day into the next morning, so the shift day
+// is the last day with badge activity from 3:00 PM on that the data runs past.
+// The next morning's badge INs (Monday's day shift after a Sunday, for
+// example) don't decide it, and a file covering a whole week lands on its last
+// full day. Files with no afternoon swipes at all fall back to the most common
+// qualifying IN date.
 function detectShiftDate(rows, nqGates) {
+  const pmDays = Object.keys(afternoonCounts(rows)).sort();
+  if (pmDays.length) {
+    const days = rowDates(rows);
+    const lastDay = days[days.length - 1];
+    const covered = pmDays.filter(d => d < lastDay);
+    return covered.length ? covered[covered.length - 1] : pmDays[pmDays.length - 1];
+  }
   const counts = {};
   let best = null, bestN = 0;
   const tally = (r) => {
@@ -147,6 +173,84 @@ function parseCSV(text) {
   });
 }
 
+// Genetec exports come as .csv or as Excel workbooks. Both become the same row
+// objects (header name to text) so everything downstream works the same way.
+// Timestamps in the workbooks are real Excel dates. They're written out in the
+// CSV's own format straight from the stored value, so no seconds get lost to
+// the cell's display format.
+const GATE_FILE_RE = /\.(csv|xlsx|xlsm|xls)$/i;
+const pad2 = n => String(n).padStart(2, "0");
+
+function excelDateText(v, kind, date1904) {
+  const p = XLSX.SSF.parse_date_code(v, { date1904 });
+  if (!p) return String(v);
+  const date = `${pad2(p.m)}/${pad2(p.d)}/${p.y}`;
+  const sec = Math.min(59, Math.floor(p.S));
+  if (kind === "date") return date;
+  if (kind === "time") return `${pad2(p.H)}:${pad2(p.M)}:${pad2(sec)}`;
+  const h12 = p.H % 12 || 12;
+  return `${date} ${pad2(h12)}:${pad2(p.M)}:${pad2(sec)} ${p.H < 12 ? "AM" : "PM"}`;
+}
+
+const DATE_KIND = { "Event Timestamp": "datetime", "EventTimestamp": "datetime", "Event_Date": "date", "Event_Time": "time" };
+
+function parseWorkbook(buf) {
+  const wb = XLSX.read(buf, { type: "array", cellDates: false, dense: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  if (!ws) return [];
+  const date1904 = !!(wb.Workbook && wb.Workbook.WBProps && wb.Workbook.WBProps.date1904);
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "", blankrows: false });
+  if (aoa.length < 2) return [];
+  const headers = aoa[0].map(h => String(h == null ? "" : h).trim());
+  return aoa.slice(1).map(cols => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      const v = cols[i];
+      if (v == null || v === "") obj[h] = "";
+      else if (typeof v === "number" && DATE_KIND[h]) obj[h] = excelDateText(v, DATE_KIND[h], date1904);
+      else obj[h] = String(v).trim();
+    });
+    return obj;
+  });
+}
+
+async function readGateFile(file) {
+  if (/\.csv$/i.test(file.name)) return parseCSV(await file.text());
+  return parseWorkbook(await file.arrayBuffer());
+}
+
+// Exports of the same day overlap (the .2 file is usually a later, longer pull
+// of the first one). Identical swipes are kept once.
+function mergeRows(lists) {
+  const seen = new Set();
+  const out = [];
+  for (const rows of lists) {
+    for (const r of rows) {
+      const key = [
+        r["CardholderGuid"] || r["Cardholder Guid"] || "",
+        r["Event Timestamp"] || r["EventTimestamp"] || "",
+        r["Door"] || "", r["Access Point"] || "", r["Area"] || "", r["Event"] || "",
+      ].join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(r);
+    }
+  }
+  return out;
+}
+
+// Calendar dates found in a set of rows
+function rowDates(rows) {
+  const dates = new Set();
+  for (const r of rows) {
+    const ts = parseDate(r["Event Timestamp"] || r["EventTimestamp"] || "");
+    if (ts) dates.add(toYMD(ts));
+  }
+  return [...dates].sort();
+}
+
+const shortDate = ymd => `${Number(ymd.slice(5, 7))}/${Number(ymd.slice(8, 10))}`;
+
 // ── MAIN ANALYSIS ─────────────────────────────────────────────────────────────
 function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAULT) {
   const shiftDate  = new Date(shiftDateStr  + "T00:00:00");
@@ -164,6 +268,13 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAU
   })).filter(r => r.guid && r.ts);
 
   df.sort((a, b) => a.ts - b.ts);
+
+  // Where each person was last seen, used to place Missing IN & OUT flags
+  const lastSeenOnShift = {}, lastSeenAny = {};
+  df.forEach(r => {
+    lastSeenAny[r.guid] = r.area;
+    if (sameDay(r.ts, shiftDate)) lastSeenOnShift[r.guid] = r.area;
+  });
 
   const dfQ  = df.filter(r => !r.isNQ);
   const dfNQ = df.filter(r =>  r.isNQ);
@@ -203,24 +314,50 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAU
       .sort((a, b) => b.ts - a.ts)
       .forEach(r => { if (!nqOutMap[r.guid]) nqOutMap[r.guid] = { ts: r.ts, gate: r.area }; });
 
+  // Report date morning: a night shift leaving shows up as qualifying OUTs
+  // before noon, ahead of any IN that day. The next day shift arriving starts
+  // with an IN, so its swipes don't count toward this shift.
+  const firstInOnReport = {};
+  df.forEach(r => {
+    if (sameDay(r.ts, reportDate) && r.access === "In" && !firstInOnReport[r.guid]) firstInOnReport[r.guid] = r.ts;
+  });
+  const nightExit = r => !r.isNQ && r.access === "Out" && sameDay(r.ts, reportDate) && r.ts.getHours() < 12 &&
+    (!firstInOnReport[r.guid] || r.ts < firstInOnReport[r.guid]);
+
   // AM IN (before noon)  → OUT must be same shift date, any time
   // PM IN (noon or after) → OUT can be same date (early leave) OR following date before noon
+  // Either way the OUT has to come after the IN.
+  // No IN → OUT on the shift date from 10:00 AM on (earlier OUTs close the
+  // night before), or a night shift OUT the next morning.
   function getValidOut(guid, rawIn) {
     const outs = dfQ.filter(r => r.guid === guid && r.access === "Out");
     if (!rawIn) {
-      const shiftOuts = outs.filter(r => sameDay(r.ts, shiftDate));
-      return shiftOuts.length ? shiftOuts.sort((a, b) => b.ts - a.ts)[0] : null;
+      const noInOuts = outs.filter(r => (sameDay(r.ts, shiftDate) && r.ts.getHours() >= 10) || nightExit(r));
+      return noInOuts.length ? noInOuts.sort((a, b) => b.ts - a.ts)[0] : null;
     }
-    const valid = rawIn.getHours() < 12
+    const valid = (rawIn.getHours() < 12
       ? outs.filter(r => sameDay(r.ts, shiftDate))
       : outs.filter(r =>
           sameDay(r.ts, shiftDate) ||
           (sameDay(r.ts, reportDate) && r.ts.getHours() < 12)
-        );
+        )).filter(r => r.ts > rawIn);
     return valid.length ? valid.sort((a, b) => b.ts - a.ts)[0] : null;
   }
 
-  const processGuids = [...new Set([...guids, ...allGuids.filter(g => inMap[g])])];
+  // Who was on site for this shift: anyone who badged IN at a qualifying gate
+  // on the shift date, badged at one from 10:00 AM on, or left on the night
+  // shift the next morning. Someone seen only the next morning (the next day
+  // shift coming in), only leaving early on the shift date (the night before),
+  // or only at off site gates during the shift isn't counted as missing
+  // anything for this shift. Off site swipes still show as reference.
+  const onShift = new Set();
+  df.forEach(r => {
+    if (r.isNQ) return;
+    if (sameDay(r.ts, shiftDate) && (r.access === "In" || r.ts.getHours() >= 10)) onShift.add(r.guid);
+    else if (nightExit(r)) onShift.add(r.guid);
+  });
+
+  const processGuids = [...new Set([...guids, ...allGuids.filter(g => inMap[g])])].filter(g => onShift.has(g));
 
   const results = processGuids.map(guid => {
     const emp    = empMap[guid] || {};
@@ -274,6 +411,11 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAU
       nqIn:  nqInMap[guid]  || null,
       nqOut: nqOutMap[guid] || null,
       status, over13,
+      // Gate area where the unmatched swipe happened (see Issues by Area)
+      flagArea:
+        status === "Missing OUT"      ? (inRec ? inRec.gate : "") :
+        status === "Missing IN"       ? (outRec ? outRec.area : "") :
+        status === "Missing IN & OUT" ? (lastSeenOnShift[guid] || lastSeenAny[guid] || "") : "",
     };
   });
 
@@ -284,8 +426,26 @@ function analyze(rows, shiftDateStr, reportDateStr, nqGates, rules = RULES_DEFAU
 // ── EXCEL EXPORT — iOS-safe blob download ────────────────────────────────────
 // XLSX.writeFile uses document.createElement('a').click() which iOS Safari blocks.
 // Instead: write to ArrayBuffer → Blob → object URL → anchor click.
+// Excel shows who made a file and with what program under File, Info. Every
+// export carries Jon Maguire as author and Excel as the program.
+function stampExcelApp(buf) {
+  try {
+    const zip = XLSX.CFB.read(new Uint8Array(buf), { type: "array" });
+    const entry = XLSX.CFB.find(zip, "/docProps/app.xml");
+    if (!entry || !entry.content) return buf;
+    const xml = new TextDecoder().decode(entry.content)
+      .replace("<Application>SheetJS</Application>", "<Application>Microsoft Excel</Application>");
+    entry.content = new TextEncoder().encode(xml);
+    entry.size = entry.content.length;
+    return XLSX.CFB.write(zip, { fileType: "zip", type: "array" });
+  } catch (_) {
+    return buf;
+  }
+}
+
 function downloadWorkbook(wb, fname) {
-  const wbOut = XLSX.write(wb, { bookType:"xlsx", type:"array" });
+  wb.Props = { ...(wb.Props || {}), Author: "Jon Maguire", LastAuthor: "Jon Maguire" };
+  const wbOut = stampExcelApp(XLSX.write(wb, { bookType:"xlsx", type:"array" }));
   const blob  = new Blob([wbOut], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
   const url   = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -307,7 +467,7 @@ function setAutoFilter(ws, headerRow, lastRow, lastCol) {
   }) };
 }
 
-function exportXLSX(results, shiftDate, reportDate, nqGates, rules = RULES_DEFAULT) {
+function exportXLSX(results, shiftDate, reportDate, nqGates, rules = RULES_DEFAULT, area = null) {
   const wb = XLSX.utils.book_new();
 
   function setColWidths(ws, widths) {
@@ -378,6 +538,13 @@ function exportXLSX(results, shiftDate, reportDate, nqGates, rules = RULES_DEFAU
   setAutoFilter(issWs, 1, 1 + issues.length, dataColHdrs.length - 1);
   XLSX.utils.book_append_sheet(wb, issWs, "ISSUES");
 
+  // ─── TAB 4: ISSUES BY AREA
+  if (area) {
+    XLSX.utils.book_append_sheet(wb,
+      areaSheet(`ISSUES BY AREA  |  Shift: ${shiftDate}  |  Report: ${reportDate}`, area.rows, area.basis),
+      "ISSUES BY AREA");
+  }
+
   // ─── TAB 4: SUMMARY
   const sumWs = XLSX.utils.aoa_to_sheet([
     [`DAILY GATE LOG SUMMARY  |  Shift: ${shiftDate}  |  Report: ${reportDate}`],
@@ -432,7 +599,7 @@ function exportXLSX(results, shiftDate, reportDate, nqGates, rules = RULES_DEFAU
 // ── WEEKLY ROLLUP EXPORT ──────────────────────────────────────────────────────
 // rollup: { emps: [{name, company, ein, days:{date:{billHrs,status}}, daysWorked, issueDays, total}], dates: [..] }
 // dayMeta: [{shift_date, total_workers, clean_count, missing_out, missing_in, missing_both, over_13, total_bill_hrs}]
-function exportWeeklyXLSX(rollup, dayMeta, rules = RULES_DEFAULT) {
+function exportWeeklyXLSX(rollup, dayMeta, rules = RULES_DEFAULT, area = null) {
   const wb = XLSX.utils.book_new();
   const { emps, dates } = rollup;
   const first = dates[0], last = dates[dates.length - 1];
@@ -490,6 +657,14 @@ function exportWeeklyXLSX(rollup, dayMeta, rules = RULES_DEFAULT) {
   setAutoFilter(dsWs, 1, 1 + dayMeta.length, 7);
   XLSX.utils.book_append_sheet(wb, dsWs, "DAILY SUMMARY");
 
+  // ─── TAB 3: ISSUES BY AREA
+  if (area) {
+    XLSX.utils.book_append_sheet(wb,
+      areaSheet(`ISSUES BY AREA  |  ${first} to ${last}  |  ${dates.length} day(s)`, area.rows, area.basis,
+        "Each person counts once per day flagged."),
+      "ISSUES BY AREA");
+  }
+
   downloadWorkbook(wb, `CP2_GateLog_Weekly_${first}_to_${last}.xlsx`);
 }
 
@@ -528,6 +703,166 @@ function Badge({ status }) {
       borderRadius:4, padding:"2px 6px", fontSize:10, fontWeight:600,
       fontFamily:"'DM Mono',monospace", whiteSpace:"nowrap",
     }}>{status}</span>
+  );
+}
+
+// ── ISSUES BY AREA ────────────────────────────────────────────────────────────
+// Every missing badge flag is placed in an area. With a roster loaded that's
+// the person's work area from the roster. Without one it's the gate area where
+// the unmatched swipe happened: the IN gate for a Missing OUT, the OUT gate for
+// a Missing IN, and the last place they badged for a Missing IN & OUT.
+const FLAG_STATUSES = new Set(["Missing IN", "Missing OUT", "Missing IN & OUT"]);
+
+const AREA_BASIS_TEXT = {
+  roster: "Grouped by each person's work area from the roster.",
+  gate: "Grouped by gate area, where the unmatched badge happened: the IN gate for a Missing OUT, the OUT gate for a Missing IN, the last place badged for Missing Both. Upload the roster and it switches to the roster's work areas.",
+};
+
+// Employee numbers are matched without regard to case or stray spaces
+const einKey = v => String(v == null ? "" : v).trim().toUpperCase();
+
+// Roster columns, found by header name so extra or reordered columns are fine
+function rosterKeyMap(keys) {
+  const km = {};
+  for (const k of keys) {
+    const lower = String(k).toLowerCase().trim();
+    if (!km.ein && (/\bein\b/.test(lower) || lower.includes("employee number") || lower.includes("employee #") || lower.includes("emp #") || lower.includes("emp no"))) km.ein = k;
+    else if (!km.firstName && lower.includes("first")) km.firstName = k;
+    else if (!km.lastName && lower.includes("last")) km.lastName = k;
+    else if (!km.supervisor && (lower.includes("supervisor") || lower.includes("foreman"))) km.supervisor = k;
+    else if (!km.area && lower.includes("area")) km.area = k;
+    else if (!km.scope && lower.includes("scope")) km.scope = k;
+  }
+  return km;
+}
+
+// Blank roster template, or the current roster in the same layout so it can be
+// edited and uploaded again
+const ROSTER_HEADERS = ["EIN", "Area", "Supervisor", "First Name", "Last Name"];
+function exportRosterTemplate(roster = []) {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([
+    ROSTER_HEADERS,
+    ...roster.map(e => [e.ein, e.area, e.supervisor, e.firstName, e.lastName]),
+  ]);
+  ws["!cols"] = [{ wch: 14 }, { wch: 30 }, { wch: 26 }, { wch: 18 }, { wch: 22 }];
+  setAutoFilter(ws, 0, Math.max(roster.length, 1), ROSTER_HEADERS.length - 1);
+  XLSX.utils.book_append_sheet(wb, ws, "ROSTER");
+  const how = XLSX.utils.aoa_to_sheet([
+    ["CP2 Gate Log roster"],
+    [],
+    ["One row per employee on the ROSTER tab. Uploading a roster replaces the previous one."],
+    [],
+    ["Column", "What to enter"],
+    ["EIN", "Required. The employee number exactly as it shows in the Genetec data (Company EIN), for example 143909 or MMR4502."],
+    ["Area", "The work area the employee is assigned to. Issues by Area groups by this column once the roster is uploaded."],
+    ["Supervisor", "Optional. Leave blank if the employee has no assigned supervisor."],
+    ["First Name, Last Name", "Optional. Shown on the Absent list."],
+  ]);
+  how["!cols"] = [{ wch: 24 }, { wch: 110 }];
+  XLSX.utils.book_append_sheet(wb, how, "HOW TO FILL IN");
+  downloadWorkbook(wb, roster.length
+    ? `CP2_GateLog_Roster_${toYMD(new Date())}.xlsx`
+    : "CP2_GateLog_Roster_Template.xlsx");
+}
+
+function gateFlagArea(r) {
+  if (r.flagArea) return r.flagArea;
+  if (r.status === "Missing OUT") return r.inGate || "";
+  if (r.status === "Missing IN") return r.outGate || "";
+  if (r.status === "Missing IN & OUT") return (r.nqOut && r.nqOut.gate) || (r.nqIn && r.nqIn.gate) || "";
+  return "";
+}
+
+function summarizeByArea(items, areaOf) {
+  const map = {};
+  for (const it of items) {
+    if (!FLAG_STATUSES.has(it.status)) continue;
+    const name = areaOf(it) || "Unknown";
+    const row = map[name] || (map[name] = { area: name, missingIn: 0, missingOut: 0, missingBoth: 0, total: 0 });
+    if (it.status === "Missing IN") row.missingIn++;
+    else if (it.status === "Missing OUT") row.missingOut++;
+    else row.missingBoth++;
+    row.total++;
+  }
+  return Object.values(map).sort((a, b) => b.total - a.total || a.area.localeCompare(b.area));
+}
+
+function areaSheet(title, rows, basis, countNote) {
+  const hdr = ["Area", "Missing IN", "Missing OUT", "Missing IN & OUT", "Total Flags", "Share of Flags (%)"];
+  const all = rows.reduce((s, r) => s + r.total, 0);
+  const sum = k => rows.reduce((s, r) => s + r[k], 0);
+  const ws = XLSX.utils.aoa_to_sheet([
+    [title],
+    [AREA_BASIS_TEXT[basis] + (countNote ? `  ${countNote}` : "")],
+    hdr,
+    ...rows.map(r => [r.area, r.missingIn, r.missingOut, r.missingBoth, r.total,
+      all ? Math.round((r.total / all) * 1000) / 10 : 0]),
+    [],
+    ["TOTAL", sum("missingIn"), sum("missingOut"), sum("missingBoth"), all, all ? 100 : 0],
+  ]);
+  ws["!cols"] = [{ wch: 40 }, { wch: 12 }, { wch: 13 }, { wch: 17 }, { wch: 12 }, { wch: 18 }];
+  setAutoFilter(ws, 2, 2 + rows.length, hdr.length - 1);
+  return ws;
+}
+
+function AreaTable({ title, rows, basis, note }) {
+  const [showAll, setShowAll] = useState(false);
+  if (!rows.length) return null;
+  const all = rows.reduce((s, r) => s + r.total, 0);
+  const top = rows[0].total || 1;
+  const shown = showAll ? rows : rows.slice(0, 8);
+  const th = { padding:"8px 12px", textAlign:"left", fontSize:10, color:"#4b5e7a",
+    textTransform:"uppercase", letterSpacing:0.8, fontWeight:600, whiteSpace:"nowrap" };
+  const num = { padding:"8px 12px", fontSize:12, fontFamily:"'DM Mono',monospace", whiteSpace:"nowrap" };
+  return (
+    <div data-testid="area-table" style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden", marginBottom:14 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", flexWrap:"wrap", gap:6,
+        padding:"10px 12px", borderBottom:"1px solid #1a2535" }}>
+        <div style={{ fontSize:12, fontWeight:700, color:"#e2e8f0", letterSpacing:0.6 }}>{title}</div>
+        <div style={{ fontSize:11, color:"#6b7a8d", fontFamily:"'DM Mono',monospace" }}>
+          {all} flag{all === 1 ? "" : "s"} in {rows.length} area{rows.length === 1 ? "" : "s"}
+        </div>
+      </div>
+      <div style={{ overflowX:"auto", WebkitOverflowScrolling:"touch" }}>
+        <table style={{ width:"100%", borderCollapse:"collapse", minWidth:600 }}>
+          <thead>
+            <tr style={{ background:"#060d16", borderBottom:"1px solid #1a2535" }}>
+              {["Area", "Missing IN", "Missing OUT", "Missing Both", "Total", ""].map((h, i) => <th key={i} style={th}>{h}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {shown.map((r, i) => (
+              <tr key={r.area} style={{ borderBottom:"1px solid #1a2535", background: i === 0 ? "#1a1010" : "transparent" }}>
+                <td style={{ padding:"8px 12px", fontSize:12, color: i === 0 ? "#fca5a5" : "#c8d6e8", fontWeight: i === 0 ? 700 : 400 }}>{r.area}</td>
+                <td style={num}>{r.missingIn}</td>
+                <td style={num}>{r.missingOut}</td>
+                <td style={num}>{r.missingBoth}</td>
+                <td style={{ ...num, fontWeight:700, color:"#e2e8f0" }}>{r.total}</td>
+                <td style={{ padding:"8px 12px", width:"28%" }}>
+                  <div style={{ height:6, borderRadius:3, background:"#1a2535" }}>
+                    <div style={{ height:6, borderRadius:3, background: i === 0 ? "#ef4444" : "#b45353",
+                      width: `${Math.max(2, Math.round((r.total / top) * 100))}%` }} />
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:8, padding:"8px 12px" }}>
+        <div style={{ fontSize:10, color:"#4b5e7a", lineHeight:1.5, flex:"1 1 280px" }}>
+          {AREA_BASIS_TEXT[basis]}{note ? ` ${note}` : ""}
+        </div>
+        {rows.length > 8 && (
+          <button onClick={() => setShowAll(v => !v)} style={{
+            background:"transparent", color:"#6b7a8d", border:"1px solid #1a2d45", borderRadius:6,
+            padding:"5px 10px", fontSize:11, cursor:"pointer", fontFamily:"'DM Mono',monospace" }}>
+            {showAll ? "Show top 8" : `Show all ${rows.length} areas`}
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -640,18 +975,57 @@ function Row({ r, idx, showRoster }) {
 
 // ── APP ───────────────────────────────────────────────────────────────────────
 export default function App() {
-  // ── Auth + Supabase state ──
-  const [authed, setAuthed] = useState(() => sessionStorage.getItem("cp2gateauth") === "1");
-  const [authPw, setAuthPw] = useState("");
-  const [authErr, setAuthErr] = useState("");
-  const [uploadedBy, setUploadedBy] = useState(() => localStorage.getItem("cp2-uploader") || "");
+  // ── Auth: everyone signs in with their own @mmrgrp.com account (Supabase
+  // Auth). The database only answers to confirmed MMR accounts, so nothing in
+  // this page grants access by itself.
+  const [session, setSession]       = useState(null);
+  const [authReady, setAuthReady]   = useState(false);
+  const [pwStep, setPwStep]         = useState(null);  // "create" or "reset" after an email link
+  const [authNotice, setAuthNotice] = useState(null);  // problem with an email link
+  const appOpen = authReady && !!session && !pwStep;
+  const accountEmail = (session && session.user && session.user.email) || "";
+
+  useEffect(() => {
+    let alive = true;
+    authStart.then(start => {
+      if (!alive) return;
+      setSession(start.session);
+      setPwStep(start.step);
+      setAuthNotice(start.notice);
+      setAuthReady(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
+      if (!alive || event === "INITIAL_SESSION") return;
+      setSession(s || null);
+      if (!s) { setPwStep(null); writePasswordStep(null); }
+    });
+    return () => { alive = false; sub.subscription.unsubscribe(); };
+  }, []);
+
+  const handlePasswordSaved = () => {
+    writePasswordStep(null);
+    setPwStep(null);
+    setAuthNotice(null);
+  };
+
+  const [uploadedBy, setUploadedBy] = useState("");
   const [history, setHistory] = useState([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
 
+  // The uploader name is remembered per account on this computer and starts
+  // out as the account's email address.
   useEffect(() => {
-    if (uploadedBy) localStorage.setItem("cp2-uploader", uploadedBy);
-  }, [uploadedBy]);
+    if (!appOpen || !accountEmail) return;
+    let saved = "";
+    try { saved = localStorage.getItem("cp2-uploader:" + accountEmail) || ""; } catch (_) { /* storage blocked */ }
+    setUploadedBy(saved || accountEmail);
+  }, [appOpen, accountEmail]);
+
+  useEffect(() => {
+    if (!accountEmail || !uploadedBy) return;
+    try { localStorage.setItem("cp2-uploader:" + accountEmail, uploadedBy); } catch (_) { /* storage blocked */ }
+  }, [uploadedBy, accountEmail]);
 
   const [screen, setScreen]         = useState("upload");
   const [results, setResults]       = useState([]);
@@ -702,6 +1076,7 @@ export default function App() {
   const [rosterMeta, setRosterMeta] = useState(null); // {uploaded_at, uploaded_by, count}
   const [rosterMsg, setRosterMsg]   = useState("");
   const rosterFileRef = useRef();
+  const rosterFileRef2 = useRef();
 
   // Fold new gate names into the seen list, keeping it sorted and deduped
   const mergeSeenGates = useCallback((names) => {
@@ -725,9 +1100,9 @@ export default function App() {
     } catch (_) { /* ignore */ }
   }, [seenGates]);
 
-  // Load roster on mount
+  // Load roster once signed in
   useEffect(() => {
-    if (!supabaseReady()) return;
+    if (!appOpen || !supabaseReady()) return;
     (async () => {
       try {
         const { data, error } = await supabase
@@ -753,11 +1128,12 @@ export default function App() {
         }
       } catch (_) { /* silent */ }
     })();
-  }, []);
+  }, [appOpen]);
 
-  // Load shared config (NQ gates + rounding rules) on mount.
+  // Load shared config (NQ gates + rounding rules) once signed in.
   // Database is the source of truth for the team; localStorage is a fallback cache.
   useEffect(() => {
+    if (!appOpen) return;
     try {
       const cached = JSON.parse(localStorage.getItem("cp2-config") || "null");
       if (cached) {
@@ -793,7 +1169,7 @@ export default function App() {
         }));
       } catch (_) { /* silent — defaults still apply */ }
     })();
-  }, []);
+  }, [appOpen]);
 
   // Save shared config for the whole team
   const handleSaveConfig = async () => {
@@ -840,7 +1216,8 @@ export default function App() {
     setNewGate("");
   };
 
-  // Roster upload handler (parses .xlsx, replaces in Supabase)
+  // Roster upload handler (.xlsx or .csv, replaces the roster in the database).
+  // EIN is required; area, supervisor, names and scope can be blank.
   const handleRosterUpload = async (file) => {
     if (!file) return;
     setRosterMsg("");
@@ -848,39 +1225,37 @@ export default function App() {
     if (!uploadedBy.trim()) { setRosterMsg("Enter your name first."); return; }
     try {
       const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array" });
-      const ws = wb.Sheets[wb.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-      if (!rows.length) throw new Error("Spreadsheet is empty.");
+      const wb = XLSX.read(buf, { type: "array", raw: /\.csv$/i.test(file.name) });
 
-      // Flexible column detection
-      const keyMap = {};
-      const first = rows[0];
-      for (const k of Object.keys(first)) {
-        const lower = k.toLowerCase().trim();
-        if (lower === "ein" || lower.includes("ein")) keyMap.ein = k;
-        else if (lower.includes("first")) keyMap.firstName = k;
-        else if (lower.includes("last")) keyMap.lastName = k;
-        else if (lower.includes("supervisor")) keyMap.supervisor = k;
-        else if (lower === "area" || lower.includes("area")) keyMap.area = k;
-        else if (lower === "scope" || lower.includes("scope")) keyMap.scope = k;
+      // Use the first tab with an EIN column (the template's ROSTER tab)
+      let rows = [], keyMap = null;
+      for (const name of wb.SheetNames) {
+        const list = XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: "" });
+        if (!list.length) continue;
+        const km = rosterKeyMap(Object.keys(list[0]));
+        if (km.ein) { rows = list; keyMap = km; break; }
       }
-      if (!keyMap.ein) throw new Error("No EIN column found in spreadsheet.");
+      if (!keyMap) throw new Error("No EIN column found. Start from the blank template.");
 
-      const parsed = rows
-        .map(r => ({
-          ein: String(r[keyMap.ein] || "").trim(),
-          first_name: String(r[keyMap.firstName] || "").trim(),
-          last_name: String(r[keyMap.lastName] || "").trim(),
-          supervisor: String(r[keyMap.supervisor] || "").trim(),
-          area: String(r[keyMap.area] || "").trim(),
-          scope: String(r[keyMap.scope] || "").trim(),
+      const cell = (r, k) => (k ? String(r[k] == null ? "" : r[k]).trim() : "");
+      const byEin = new Map();
+      for (const r of rows) {
+        const ein = cell(r, keyMap.ein);
+        if (!ein) continue;
+        byEin.set(ein.toUpperCase(), {   // a repeated EIN keeps its last row
+          ein,
+          first_name: cell(r, keyMap.firstName),
+          last_name: cell(r, keyMap.lastName),
+          supervisor: cell(r, keyMap.supervisor),
+          area: cell(r, keyMap.area),
+          scope: cell(r, keyMap.scope),
           uploaded_by: uploadedBy.trim(),
           uploaded_at: new Date().toISOString(),
-        }))
-        .filter(r => r.ein);
+        });
+      }
+      const parsed = [...byEin.values()];
 
-      if (!parsed.length) throw new Error("No valid rows with EIN found.");
+      if (!parsed.length) throw new Error("No rows with an EIN found.");
 
       // Replace strategy: delete all, insert new
       const { error: delErr } = await supabase.from("employees").delete().neq("ein", "___never___");
@@ -902,52 +1277,84 @@ export default function App() {
   // Compute absent employees: in roster but no badge event today
   const absentEmployees = (() => {
     if (!roster.length || !results.length) return [];
-    const badgedEINs = new Set(results.map(r => String(r.ein || "").trim()).filter(Boolean));
-    return roster.filter(emp => emp.ein && !badgedEINs.has(emp.ein));
+    const badgedEINs = new Set(results.map(r => einKey(r.ein)).filter(Boolean));
+    return roster.filter(emp => emp.ein && !badgedEINs.has(einKey(emp.ein)));
   })();
 
   const currentGates = () => new Set(nqText.split("\n").map(s => s.trim()).filter(Boolean));
 
-  const processFile = useCallback((file) => {
+  const processFile = useCallback(async (file) => {
     if (!file) return;
     setFileName(file.name);
     setError("");
     setProcessing(true);
-    const reader = new FileReader();
-    reader.onload = e => {
-      try {
-        const rows = parseCSV(e.target.result);
-        if (!rows.length) throw new Error("No data rows found in CSV.");
-        mergeSeenGates(rows.map(r => r["Area"]));
-        const nqGates = currentGates();
-        setResults(analyze(rows, shiftDate, reportDate, nqGates, rules));
-        setScreen("results");
-      } catch(err) {
-        setError("Error: " + err.message);
-      } finally {
-        setProcessing(false);
+    try {
+      const rows = await readGateFile(file);
+      if (!rows.length) throw new Error("No data rows found in the file.");
+      mergeSeenGates(rows.map(r => r["Area"]));
+      const nqGates = currentGates();
+      // Keep the chosen shift date when the file covers that day's afternoon.
+      // Otherwise use the day the file was pulled for, read from the data.
+      let sd = shiftDate, rd = reportDate;
+      const picked = afternoonCounts(rows)[sd] ? null : detectShiftDate(rows, nqGates);
+      if (picked && picked !== sd) {
+        sd = picked;
+        rd = toYMD(addDays(new Date(picked + "T00:00:00"), 1));
+        setShiftDate(sd);
+        setReportDate(rd);
       }
-    };
-    reader.readAsText(file);
+      setResults(analyze(rows, sd, rd, nqGates, rules));
+      setScreen("results");
+    } catch (err) {
+      setError("Error: " + err.message);
+    } finally {
+      setProcessing(false);
+    }
   }, [shiftDate, reportDate, nqText, rules, mergeSeenGates]);
 
-  // Multiple files → bulk screen: each file parsed, shift date auto-detected,
-  // then every day is saved to the database in one pass.
+  // Multiple files → bulk screen. Each file's shift date is detected; files
+  // for the same shift date are combined with duplicate swipes removed, then
+  // every day is saved to the database in one pass.
   const prepareBulk = useCallback((files) => {
     setError("");
     setProcessing(true);
     const nqGates = currentGates();
     Promise.all([...files].map(f =>
-      f.text().then(text => {
-        const rows = parseCSV(text);
-        if (!rows.length) return { name: f.name, rows: [], shiftDate: "", reportDate: "", status: "No data rows" };
-        mergeSeenGates(rows.map(r => r["Area"]));
-        const sd = detectShiftDate(rows, nqGates) || toYMD(addDays(new Date(), -1));
-        return { name: f.name, rows, shiftDate: sd, reportDate: toYMD(addDays(new Date(sd + "T00:00:00"), 1)), status: "" };
-      }).catch(err => ({ name: f.name, rows: [], shiftDate: "", reportDate: "", status: "Read error: " + err.message }))
-    )).then(parsed => {
-      parsed.sort((a, b) => a.shiftDate.localeCompare(b.shiftDate));
-      setBulkFiles(parsed);
+      readGateFile(f)
+        .then(rows => ({ name: f.name, rows, problem: rows.length ? "" : "No data rows" }))
+        .catch(err => ({ name: f.name, rows: [], problem: "Read error: " + err.message }))
+    )).then(read => {
+      const groups = {};
+      const problems = [];
+      for (const f of read) {
+        if (f.problem) {
+          problems.push({ name: f.name, rows: [], shiftDate: "", reportDate: "", note: "", status: f.problem });
+          continue;
+        }
+        mergeSeenGates(f.rows.map(r => r["Area"]));
+        const sd = detectShiftDate(f.rows, nqGates) || toYMD(addDays(new Date(), -1));
+        const g = groups[sd] || (groups[sd] = { names: [], lists: [] });
+        g.names.push(f.name);
+        g.lists.push(f.rows);
+      }
+      const prepared = Object.entries(groups).map(([sd, g]) => {
+        const rows = g.lists.length > 1 ? mergeRows(g.lists) : g.lists[0];
+        const dates = rowDates(rows);
+        const notes = [];
+        if (g.names.length > 1) notes.push(`${g.names.length} files combined, duplicate swipes removed`);
+        if (dates.length > 3) notes.push(`file covers ${shortDate(dates[0])} to ${shortDate(dates[dates.length - 1])}; only the shift date is used`);
+        return {
+          name: g.names.join(" + "),
+          rows,
+          shiftDate: sd,
+          reportDate: toYMD(addDays(new Date(sd + "T00:00:00"), 1)),
+          note: notes.join(". "),
+          status: "",
+        };
+      });
+      const all = [...prepared, ...problems]
+        .sort((a, b) => (a.shiftDate || "9999").localeCompare(b.shiftDate || "9999"));
+      setBulkFiles(all);
       setScreen("bulk");
       setProcessing(false);
     });
@@ -960,8 +1367,11 @@ export default function App() {
   }, [nqText, mergeSeenGates]);
 
   const handleFiles = useCallback((fileList) => {
-    const files = [...(fileList || [])].filter(f => f && f.name.toLowerCase().endsWith(".csv"));
-    if (!files.length) return;
+    const files = [...(fileList || [])].filter(f => f && GATE_FILE_RE.test(f.name));
+    if (!files.length) {
+      if (fileList && fileList.length) setError("Use the Genetec export: an .xlsx or .csv file.");
+      return;
+    }
     if (files.length === 1) processFile(files[0]);
     else prepareBulk(files);
   }, [processFile, prepareBulk]);
@@ -972,7 +1382,7 @@ export default function App() {
   }, [handleFiles]);
 
   const handleExport = () => {
-    exportXLSX(results, shiftDate, reportDate, currentGates(), rules);
+    exportXLSX(results, shiftDate, reportDate, currentGates(), rules, { rows: dailyAreaRows, basis: areaBasis });
   };
 
   // Derived stats
@@ -987,14 +1397,14 @@ export default function App() {
   const rosterByEIN = (() => {
     const map = {};
     for (const r of roster) {
-      if (r.ein) map[String(r.ein).trim()] = r;
+      if (r.ein) map[einKey(r.ein)] = r;
     }
     return map;
   })();
 
   // Enrich each result row with supervisor / area / scope / notInRoster flag
   const enriched = results.map(r => {
-    const ein = String(r.ein || "").trim();
+    const ein = einKey(r.ein);
     const emp = ein ? rosterByEIN[ein] : null;
     const notInRoster = roster.length > 0 && (!ein || !emp);
     return {
@@ -1012,6 +1422,15 @@ export default function App() {
   const scopes      = [...new Set(enriched.map(r => r.scope).filter(Boolean))].sort();
 
   const notInRosterCount = enriched.filter(r => r.notInRoster).length;
+
+  // Issues by area: roster work areas when a roster is loaded, gate areas otherwise
+  const areaBasis = roster.length > 0 ? "roster" : "gate";
+  const rosterAreaOfEIN = ein => {
+    const emp = rosterByEIN[einKey(ein)];
+    return emp ? (emp.area || "No area in roster") : "Not in roster";
+  };
+  const areaOf = areaBasis === "roster" ? (it => rosterAreaOfEIN(it.ein)) : gateFlagArea;
+  const dailyAreaRows = summarizeByArea(results, areaOf);
 
   const filtered = enriched.filter(r => {
     const mf =
@@ -1205,7 +1624,7 @@ export default function App() {
             days: {}, daysWorked: 0, issueDays: 0, total: 0,
           });
           // Same date in two selected reports: the later-saved report wins
-          e.days[rep.shift_date] = { billHrs: r.billHrs, status: r.status, over13: r.over13 };
+          e.days[rep.shift_date] = { billHrs: r.billHrs, status: r.status, over13: r.over13, flagArea: gateFlagArea(r) };
         }
       }
       const emps = Object.values(byEmp).map(e => {
@@ -1225,10 +1644,16 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
-    sessionStorage.removeItem("cp2gateauth");
-    setAuthed(false);
+  const handleLogout = async () => {
     setMenuOpen(false);
+    // Local scope ends the session in this browser only; the person stays
+    // signed in on their other devices.
+    try { await supabase.auth.signOut({ scope: "local" }); } catch (_) { /* already signed out */ }
+    writePasswordStep(null);
+    setSession(null); setPwStep(null);
+    setResults([]); setFileName(""); setScreen("upload");
+    setHistory([]); setWeeklyReports([]); setRollup(null); setSelIds(new Set());
+    setRoster([]); setRosterMeta(null); setUploadedBy("");
   };
 
   const dupDates = (() => {
@@ -1238,47 +1663,18 @@ export default function App() {
   })();
 
   // ── Auth gate ──
-  if (!authed) {
+  if (!authReady) {
+    return <div style={{ minHeight:"100vh", background:"#07080b" }} />;
+  }
+  if (!session || pwStep) {
     return (
-      <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
-        fontFamily:"'DM Sans','Segoe UI',sans-serif",
-        display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
-        <div style={{ background:"#0a1320", border:"1px solid #1a2535",
-          borderRadius:10, padding:28, maxWidth:380, width:"100%" }}>
-          <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0", marginBottom:6 }}>CP2 Gate Log</div>
-          <div style={{ fontSize:11, color:"#4b5e7a", letterSpacing:1, textTransform:"uppercase", marginBottom:18 }}>MMR Constructors</div>
-          <input
-            type="password"
-            value={authPw}
-            onChange={e => setAuthPw(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === "Enter") {
-                if (authPw === SHARED_PASSWORD) {
-                  sessionStorage.setItem("cp2gateauth", "1");
-                  setAuthed(true); setAuthErr("");
-                } else { setAuthErr("Incorrect password"); }
-              }
-            }}
-            placeholder="Password"
-            autoFocus
-            style={{ ...inp, marginBottom:12 }}
-          />
-          {authErr && <div style={{ color:"#ef4444", fontSize:12, marginBottom:10 }}>{authErr}</div>}
-          <button
-            onClick={() => {
-              if (authPw === SHARED_PASSWORD) {
-                sessionStorage.setItem("cp2gateauth", "1");
-                setAuthed(true); setAuthErr("");
-              } else { setAuthErr("Incorrect password"); }
-            }}
-            style={{
-              background:"#1d4ed8", color:"#fff", border:"none",
-              borderRadius:6, padding:"10px 16px", fontSize:13, fontWeight:600,
-              cursor:"pointer", width:"100%", fontFamily:"'DM Mono',monospace",
-            }}
-          >Enter</button>
-        </div>
-      </div>
+      <LoginScreen
+        step={session ? pwStep : null}
+        email={accountEmail}
+        notice={authNotice}
+        onPasswordSaved={handlePasswordSaved}
+        onSignOut={handleLogout}
+      />
     );
   }
 
@@ -1400,6 +1796,7 @@ export default function App() {
                     <td style={{ padding:"9px 12px", fontSize:12,
                       color: f.status.startsWith("Saved") ? "#34d399" : f.status ? "#f87171" : "#4b5e7a" }}>
                       {f.status || "Ready"}
+                      {f.note && <div style={{ color:"#6b7a8d", fontSize:10, marginTop:3 }}>{f.note}</div>}
                     </td>
                   </tr>
                 ))}
@@ -1442,6 +1839,11 @@ export default function App() {
       : [];
     const grandTotal = rollup ? rollup.emps.reduce((s, e) => s + e.total, 0) : 0;
     const issueCells = rollup ? rollup.emps.reduce((s, e) => s + e.issueDays, 0) : 0;
+    const weeklyAreaRows = rollup
+      ? summarizeByArea(
+          rollup.emps.flatMap(e => Object.values(e.days).map(d => ({ status: d.status, flagArea: d.flagArea, ein: e.ein }))),
+          areaOf)
+      : [];
 
     return (
       <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
@@ -1534,7 +1936,7 @@ export default function App() {
           >{weeklyBusy ? "Building…" : "Build Rollup"}</button>
           {rollup && (
             <button
-              onClick={() => exportWeeklyXLSX(rollup, rollupMeta, rules)}
+              onClick={() => exportWeeklyXLSX(rollup, rollupMeta, rules, { rows: weeklyAreaRows, basis: areaBasis })}
               style={{ ...btn(true, "#1d4ed8"), background:"#0e7490", borderColor:"#0e7490", color:"#fff" }}
             >↓ Excel</button>
           )}
@@ -1547,6 +1949,13 @@ export default function App() {
             <StatCard label="Issue Days"  value={issueCells}            color="#ef4444" />
             <StatCard label="Total Hrs"   value={decToHM(grandTotal)}   color="#22c55e" />
           </div>
+
+          <AreaTable
+            title="ISSUES BY AREA, SELECTED DAYS"
+            rows={weeklyAreaRows}
+            basis={areaBasis}
+            note="Each person counts once per day flagged."
+          />
 
           <div style={{ marginBottom:10 }}>
             <input
@@ -1711,7 +2120,10 @@ export default function App() {
             <button onClick={() => setMenuOpen(o => !o)} style={btn(false, "#334155")}>≡</button>
             {menuOpen && (
               <div style={{ position:"absolute", right:0, top:34, background:"#0a1320",
-                border:"1px solid #1a2535", borderRadius:8, padding:6, minWidth:140, zIndex:20 }}>
+                border:"1px solid #1a2535", borderRadius:8, padding:6, minWidth:200, zIndex:20 }}>
+                <div style={{ padding:"4px 6px 8px", fontSize:10, color:"#4b5e7a", lineHeight:1.5, wordBreak:"break-all" }}>
+                  Signed in as<br /><span style={{ color:"#c8d6e8", fontSize:11 }}>{accountEmail}</span>
+                </div>
                 <button onClick={loadHistory} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>History</button>
                 <button onClick={loadWeekly} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>Weekly Rollup</button>
                 <button onClick={handleLogout} style={{ ...btn(false, "#334155"), width:"100%", color:"#ef4444", borderColor:"#7f1d1d" }}>Logout</button>
@@ -1919,20 +2331,26 @@ export default function App() {
           {/* ── Employee Roster Upload ── */}
           <div style={{ marginTop:14, paddingTop:14, borderTop:"1px solid #1a2535" }}>
             <label style={{ fontSize:10, color:"#4b5e7a", textTransform:"uppercase", letterSpacing:1 }}>
-              MMR Employee Roster (.xlsx)
+              MMR Employee Roster (.xlsx or .csv)
             </label>
             <div style={{ fontSize:10, color:"#4b5e7a", marginTop:2, marginBottom:6,
-              fontFamily:"'DM Mono',monospace" }}>
-              Columns: EIN, First Name, Last Name, Supervisor, Area, Scope. New upload replaces previous.
+              fontFamily:"'DM Mono',monospace", lineHeight:1.5 }}>
+              Columns: EIN (required), Area, Supervisor (can be blank), First Name, Last Name.
+              A new upload replaces the previous roster. Upload the roster and it switches to the roster's work areas.
             </div>
             <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
               <input
                 ref={rosterFileRef}
+                data-testid="roster-file-config"
                 type="file"
-                accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                onChange={e => handleRosterUpload(e.target.files[0])}
+                accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                onChange={e => { handleRosterUpload(e.target.files[0]); e.target.value = ""; }}
                 style={{ display:"none" }}
               />
+              <button onClick={() => exportRosterTemplate()} style={btn(false, "#334155")}>↓ Blank Template</button>
+              {roster.length > 0 && (
+                <button onClick={() => exportRosterTemplate(roster)} style={btn(false, "#334155")}>↓ Current Roster</button>
+              )}
               <button
                 onClick={() => rosterFileRef.current?.click()}
                 style={{
@@ -1968,7 +2386,7 @@ export default function App() {
                 Daily Gate Log Analysis
               </div>
               <div style={{ fontSize:13, color:"#4b5e7a", marginTop:4 }}>
-                Upload the Genetec CSV export to begin
+                Upload the Genetec export (.xlsx or .csv) to begin
               </div>
             </div>
 
@@ -2030,12 +2448,13 @@ export default function App() {
             >
               <div style={{ fontSize:36, marginBottom:10 }}>📂</div>
               <div style={{ fontSize:15, fontWeight:600, color:"#e2e8f0" }}>
-                {processing ? "Processing…" : fileName || "Tap to browse or drop CSV files"}
+                {processing ? "Processing…" : fileName || "Tap to browse or drop Genetec files"}
               </div>
-              <div style={{ fontSize:11, color:"#4b5e7a", marginTop:4 }}>
-                Genetec raw export (.csv) — drop several days at once to save them all to the database
+              <div style={{ fontSize:11, color:"#4b5e7a", marginTop:4, lineHeight:1.5 }}>
+                Genetec raw export (.xlsx or .csv). Drop several days at once to save them all;
+                two files for the same day are combined automatically.
               </div>
-              <input ref={fileRef} type="file" accept=".csv" multiple style={{display:"none"}}
+              <input ref={fileRef} data-testid="gate-files" type="file" accept=".xlsx,.xls,.xlsm,.csv" multiple style={{display:"none"}}
                 onChange={e => { handleFiles(e.target.files); e.target.value = ""; }} />
             </div>
 
@@ -2044,6 +2463,37 @@ export default function App() {
                 border:"1px solid #991b1b", borderRadius:8, padding:"10px 14px",
                 width:"100%", maxWidth:460 }}>{error}</div>
             )}
+
+            {/* Employee roster: blank template out, filled roster in */}
+            <div data-testid="roster-card" style={{ width:"100%", maxWidth:460, background:"#0a1320",
+              border:"1px solid #1a2535", borderRadius:10, padding:"12px 14px" }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", gap:8, flexWrap:"wrap" }}>
+                <div style={{ fontSize:12, fontWeight:700, color:"#e2e8f0", letterSpacing:0.4 }}>Employee roster</div>
+                <div style={{ fontSize:11, fontFamily:"'DM Mono',monospace", color: roster.length ? "#34d399" : "#6b7a8d" }}>
+                  {roster.length ? `${roster.length} employees loaded` : "No roster loaded"}
+                </div>
+              </div>
+              <div style={{ fontSize:11, color:"#6b7a8d", marginTop:6, lineHeight:1.5 }}>
+                Upload the roster and it switches to the roster's work areas. Download the blank template,
+                fill in each employee number with their area and/or supervisor (supervisor can be blank), then upload it.
+              </div>
+              <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginTop:10 }}>
+                <button onClick={() => exportRosterTemplate()} style={btn(false, "#334155")}>↓ Blank Template</button>
+                {roster.length > 0 && (
+                  <button onClick={() => exportRosterTemplate(roster)} style={btn(false, "#334155")}>↓ Current Roster</button>
+                )}
+                <button onClick={() => rosterFileRef2.current?.click()}
+                  style={{ ...btn(true, "#1d4ed8"), background:"#1d4ed8", color:"#fff" }}>↑ Upload Roster</button>
+                <input ref={rosterFileRef2} data-testid="roster-file" type="file" accept=".xlsx,.xls,.csv" style={{ display:"none" }}
+                  onChange={e => { handleRosterUpload(e.target.files[0]); e.target.value = ""; }} />
+              </div>
+              {rosterMsg && (
+                <div style={{ marginTop:8, fontSize:12, fontFamily:"'DM Mono',monospace",
+                  color: rosterMsg.startsWith("Upload error") || rosterMsg.startsWith("Enter") || rosterMsg.startsWith("Database") ? "#f87171" : "#34d399" }}>
+                  {rosterMsg}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -2068,6 +2518,8 @@ export default function App() {
             <StatCard label="Over 13 Hrs"  value={over13}          color="#fb923c" />
             <StatCard label="Total Hrs"    value={decToHM(totalH)} color="#0ea5e9" />
           </div>
+
+          <AreaTable title="ISSUES BY AREA" rows={dailyAreaRows} basis={areaBasis} />
 
           {/* FILTERS — wrap naturally; search on its own row on mobile */}
           <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10, alignItems:"center" }}>
