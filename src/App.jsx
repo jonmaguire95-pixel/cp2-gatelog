@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
-import { supabase, supabaseReady, authStart, writePasswordStep } from "./supabase.js";
+import { supabase, supabaseReady, authStart, writePasswordStep, takeCodeIntent } from "./supabase.js";
 import LoginScreen from "./LoginScreen.jsx";
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -980,7 +980,7 @@ export default function App() {
   // this page grants access by itself.
   const [session, setSession]       = useState(null);
   const [authReady, setAuthReady]   = useState(false);
-  const [pwStep, setPwStep]         = useState(null);  // "create" or "reset" after an email link
+  const [pwStep, setPwStep]         = useState(null);  // "create" or "reset" after an emailed code or link
   const [authNotice, setAuthNotice] = useState(null);  // problem with an email link
   const appOpen = authReady && !!session && !pwStep;
   const accountEmail = (session && session.user && session.user.email) || "";
@@ -997,7 +997,20 @@ export default function App() {
     const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
       if (!alive || event === "INITIAL_SESSION") return;
       setSession(s || null);
-      if (!s) { setPwStep(null); writePasswordStep(null); }
+      if (!s) { setPwStep(null); writePasswordStep(null); return; }
+      // Signed in by typing an emailed code: show the password screen the code
+      // was for. A reset always sets a new password. A new account chooses
+      // one, unless it already has one (then it goes straight in).
+      if (event === "SIGNED_IN" || event === "PASSWORD_RECOVERY") {
+        const intent = takeCodeIntent();
+        if (intent) {
+          const meta = (s.user && s.user.user_metadata) || {};
+          const step = intent === "forgot" || event === "PASSWORD_RECOVERY" ? "reset" : meta.password_set ? null : "create";
+          writePasswordStep(step);
+          setPwStep(step);
+          setAuthNotice(null);
+        }
+      }
     });
     return () => { alive = false; sub.subscription.unsubscribe(); };
   }, []);

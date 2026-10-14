@@ -26,10 +26,10 @@ export function isWorkEmail(value) {
   return /^[^@\s]+@mmrgrp\.com$/.test(normalizeEmail(value));
 }
 
-// Email links (confirm a new account, reset a password) come back to the site
-// with the sign in details after the # in the address. Read them once and wipe
-// them from the address bar and from this history entry right away, before the
-// page does anything else.
+// Email links (from emails sent before the switch to codes) come back to the
+// site with the sign in details after the # in the address. Read them once and
+// wipe them from the address bar and from this history entry right away, before
+// the page does anything else.
 function takeLinkFromAddress() {
   if (typeof window === "undefined") return null;
   const { hash, search, pathname } = window.location;
@@ -82,8 +82,27 @@ export function siteAddress() {
   return `${window.location.origin}/`;
 }
 
-// After arriving from an email link the person still has to choose a password.
-// This remembers that for the current tab, so a page refresh doesn't skip it.
+// Account emails carry a code the person types on the site instead of a sign in
+// link. Company email scanners open every link in a message before the person
+// sees it, which used up one time links. A scanner can't use up a code.
+// When a code is typed, this notes what it was for (a new account or a
+// password reset) so the page knows which password screen to show once the
+// code signs the person in. It is read once.
+let codeIntent = null;
+
+export function setCodeIntent(kind) {
+  codeIntent = kind === "register" || kind === "forgot" ? kind : null;
+}
+
+export function takeCodeIntent() {
+  const v = codeIntent;
+  codeIntent = null;
+  return v;
+}
+
+// After arriving from an emailed code or link the person still has to choose a
+// password. This remembers that for the current tab, so a page refresh doesn't
+// skip it.
 const STEP_KEY = "cp2gl-password-step";
 
 export function readPasswordStep() {

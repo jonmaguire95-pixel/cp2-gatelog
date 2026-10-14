@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { QUOTES, QUOTE_AUTHOR } from "./quotes.js";
-import { supabase, normalizeEmail, isWorkEmail, siteAddress } from "./supabase.js";
+import { supabase, normalizeEmail, isWorkEmail, siteAddress, setCodeIntent, takeCodeIntent } from "./supabase.js";
 
 // Sign in screen for the CP2 Gate Log: MMR mark, an industrial skyline drawn
 // in MMR colors (no site photos, so nothing restricted ends up on a public
 // page), the account forms, and a rotating panel of Pepper Rutland quotes.
 //
-// Accounts: anyone with an @mmrgrp.com email can create one. They get an email
-// link to confirm the address, then choose their own password. The server
-// enforces the domain rule, and the database only answers to confirmed accounts.
+// Accounts: anyone with an @mmrgrp.com email can create one. They get an
+// emailed code to confirm the address, then choose their own password. A code
+// is used instead of a link because company email scanners open links before
+// the person does, which used up one time links. The server enforces the
+// domain rule, and the database only answers to confirmed accounts.
 
 const LOGO_RATIO = 466.2 / 227.8;
 
@@ -189,10 +191,10 @@ function SiteBackdrop() {
   );
 }
 
-// About 3.5 words a second plus a pause to take it in, between 6 and 16 seconds.
+// About 2.6 words a second plus a pause to take it in, between 8 and 22 seconds.
 export function readMs(text) {
   const words = String(text || "").trim().split(/\s+/).filter(Boolean).length;
-  return Math.min(16000, Math.max(6000, 2500 + words * 290));
+  return Math.min(22000, Math.max(8000, 3500 + words * 380));
 }
 
 function shuffledOrder(n, avoidFirst) {
@@ -264,7 +266,7 @@ function QuoteRotator({ quotes, author }) {
     };
     if (reduceMotion) { goNext(); return; }
     setShown(false);
-    swapRef.current = setTimeout(goNext, 450);
+    swapRef.current = setTimeout(goNext, 600);
   }, [list.length, reduceMotion]);
 
   useEffect(() => {
@@ -331,9 +333,10 @@ const RESEND_SECONDS = 60; // the server allows one email per address per minute
 
 const OFFLINE = "Can't reach the server. Check your connection and try again.";
 
+// Only for links in emails sent before the switch to codes
 const NOTICE_TEXT = {
-  "link-expired": "That email link has expired or was already used. Request a new one below.",
-  "link-failed": "That email link didn't work. Request a new one below.",
+  "link-expired": "That email link has expired or was already used. Use Forgot password or Create a new account to get a code.",
+  "link-failed": "That email link didn't work. Use Forgot password or Create a new account to get a code.",
 };
 
 function errInfo(err) {
@@ -347,7 +350,7 @@ const isOffline = e => e.status === 0 || e.status === 502 || e.status === 503 ||
 
 function signInMessage(err) {
   const e = errInfo(err);
-  if (e.code === "email_not_confirmed") return "Confirm your email first. Use the link we sent you, or choose Create a new account to get a new one.";
+  if (e.code === "email_not_confirmed") return "Confirm your email first. Choose Create a new account to get a code.";
   if (e.status === 429 || e.code === "over_request_rate_limit") return "Too many attempts. Wait a few minutes, then try again.";
   if (e.code === "user_banned") return "This account is turned off. Contact the Gate Log admin.";
   if (isOffline(e)) return OFFLINE;
@@ -355,7 +358,7 @@ function signInMessage(err) {
   return "Email or password is incorrect.";
 }
 
-function linkMessage(err) {
+function sendMessage(err) {
   const e = errInfo(err);
   if (e.code === "over_email_send_rate_limit" || e.status === 429) return "Too many emails were requested just now. Wait a few minutes, then try again.";
   if (e.code === "email_address_not_authorized") return "Email delivery isn't switched on for this address yet. Contact the Gate Log admin.";
@@ -363,6 +366,14 @@ function linkMessage(err) {
   if (e.code === "email_address_invalid" || e.code === "validation_failed") return "That email address isn't valid.";
   if (isOffline(e)) return OFFLINE;
   return "The email couldn't be sent right now. Try again in a few minutes.";
+}
+
+function codeMessage(err) {
+  const e = errInfo(err);
+  if (e.status === 429 || e.code === "over_request_rate_limit") return "Too many tries. Wait a few minutes, then try again.";
+  if (e.code === "otp_expired" || e.status === 403 || e.status === 400) return "That code didn't work. Check the newest Gate Log email, or send a new code.";
+  if (isOffline(e)) return OFFLINE;
+  return "The code couldn't be checked right now. Try again in a few minutes.";
 }
 
 function passwordMessage(err) {
@@ -376,7 +387,7 @@ function passwordMessage(err) {
   }
   if (e.code === "same_password") return "That's already your password. Choose a different one.";
   if (["reauthentication_needed", "session_not_found", "session_expired", "bad_jwt"].includes(e.code) || e.status === 401 || e.status === 403) {
-    return "This link has timed out. Sign out and request a new one.";
+    return "This screen has timed out. Sign out and get a new code.";
   }
   if (e.status === 429) return "Too many attempts. Wait a few minutes, then try again.";
   if (isOffline(e)) return OFFLINE;
@@ -441,7 +452,7 @@ function ErrorLine({ text }) {
   return <div id="lg-error" className="lg-error" role="alert">{text}</div>;
 }
 
-// Sign in, create a new account, forgot password, and the check your email view.
+// Sign in, create a new account, forgot password, and the enter your code view.
 function AccountForms({ initialNotice }) {
   const [view, setView] = useState("signin");
   const [email, setEmail] = useState("");
@@ -450,7 +461,8 @@ function AccountForms({ initialNotice }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState({ text: "", field: "" });
   const [notice, setNotice] = useState(initialNotice || null);
-  const [sent, setSent] = useState({ kind: "", to: "" });
+  const [pending, setPending] = useState({ kind: "register", to: "" });
+  const [code, setCode] = useState("");
   const [cooldown, setCooldown] = useCountdown();
 
   const fail = (text, field = "") => setError({ text, field });
@@ -471,6 +483,7 @@ function AccountForms({ initialNotice }) {
     if (!password) { fail("Enter your password.", "password"); return; }
     setBusy(true);
     setError({ text: "", field: "" });
+    takeCodeIntent();
     try {
       const { error: err } = await supabase.auth.signInWithPassword({ email: addr, password });
       if (err) fail(signInMessage(err), "password");
@@ -482,12 +495,15 @@ function AccountForms({ initialNotice }) {
     }
   };
 
-  const sendLink = async kind => {
+  // Emails a code: a new account confirms its address with it, a reset uses it
+  // to set a new password.
+  const sendCode = async kind => {
     if (busy) return;
-    const fromSent = view === "sent";
-    const addr = normalizeEmail(email);
-    if (!addr) { fail("Enter your work email.", "email"); return; }
-    if (!isWorkEmail(addr)) { fail("Use your @mmrgrp.com work email. Other addresses can't have an account.", "email"); return; }
+    const onCodeView = view === "code";
+    const addr = normalizeEmail(onCodeView && pending.to ? pending.to : email);
+    const field = onCodeView && pending.to ? "" : "email";
+    if (!addr) { fail("Enter your work email.", field); return; }
+    if (!isWorkEmail(addr)) { fail("Use your @mmrgrp.com work email. Other addresses can't have an account.", field); return; }
     setBusy(true);
     setError({ text: "", field: "" });
     try {
@@ -498,60 +514,133 @@ function AccountForms({ initialNotice }) {
           })
         : await supabase.auth.resetPasswordForEmail(addr, { redirectTo: siteAddress() });
       if (err) {
-        fail(linkMessage(err), fromSent ? "" : "email");
+        fail(sendMessage(err), field);
       } else {
         setEmail(addr);
-        setSent({ kind, to: addr });
-        go("sent");
+        setPending({ kind, to: addr });
+        setCode("");
+        go("code");
         setCooldown(RESEND_SECONDS);
       }
     } catch (_) {
-      fail(OFFLINE, fromSent ? "" : "email");
+      fail(OFFLINE, field);
     } finally {
       setBusy(false);
     }
   };
 
+  // Checks the typed code. The kind of code this screen asked for is tried
+  // first, then the other kind, in case the newest email was for the other one.
+  // Once a code works the page moves on to the password screen by itself.
+  const checkCode = async () => {
+    if (busy) return;
+    const addr = normalizeEmail(pending.to || email);
+    const token = String(code || "").replace(/\D/g, "");
+    if (!addr) { fail("Enter your work email.", "email"); return; }
+    if (!isWorkEmail(addr)) { fail("Use your @mmrgrp.com work email.", "email"); return; }
+    if (token.length < 6 || token.length > 10) { fail("Enter the code from the email.", "code"); return; }
+    setBusy(true);
+    setError({ text: "", field: "" });
+    const types = pending.kind === "forgot" ? ["recovery", "email"] : ["email", "recovery"];
+    let lastErr = null;
+    try {
+      for (const type of types) {
+        setCodeIntent(pending.kind);
+        const { data, error: err } = await supabase.auth.verifyOtp({ email: addr, token, type });
+        if (!err && data && data.session) return;
+        takeCodeIntent();
+        lastErr = err;
+        const e = errInfo(err);
+        if (!(e.code === "otp_expired" || e.status === 403)) break;
+      }
+      fail(codeMessage(lastErr), "code");
+    } catch (_) {
+      takeCodeIntent();
+      fail(OFFLINE, "code");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // For someone who already has a code, for example after closing the page
+  const haveCode = () => {
+    const addr = normalizeEmail(email);
+    setPending({ kind: view === "forgot" ? "forgot" : "register", to: isWorkEmail(addr) ? addr : "" });
+    setCode("");
+    go("code");
+  };
+
   if (view === "register" || view === "forgot") {
     const register = view === "register";
     return (
-      <Card title={register ? "Create your account" : "Reset your password"} onSubmit={() => sendLink(view)}>
+      <Card title={register ? "Create your account" : "Reset your password"} onSubmit={() => sendCode(view)}>
         <p className="lg-text">
           {register
-            ? "Use your @mmrgrp.com work email. We'll send you a link to confirm it, then you'll choose your own password."
-            : "Enter your work email and we'll send you a link to choose a new password."}
+            ? "Use your @mmrgrp.com work email. We'll email you a code to confirm it, then you'll choose your own password."
+            : "Enter your work email and we'll email you a code to set a new password."}
         </p>
         <label className="lg-label" htmlFor="lg-email">Work email</label>
         <EmailInput value={email} onChange={onEmail} invalid={error.field === "email"} autoComplete="email" />
         <ErrorLine text={error.text} />
         <button type="submit" className="lg-submit" disabled={busy}>
-          {busy ? "Sending…" : register ? "Send confirmation link" : "Send reset link"}
+          {busy ? "Sending…" : "Send code"}
         </button>
-        <button type="button" className="lg-back" onClick={() => go("signin")}>Back to sign in</button>
+        <button type="button" className="lg-back" onClick={haveCode}>Already have a code?</button>
+        <button type="button" className="lg-back lg-back-tight" onClick={() => go("signin")}>Back to sign in</button>
       </Card>
     );
   }
 
-  if (view === "sent") {
-    const register = sent.kind === "register";
+  if (view === "code") {
+    const register = pending.kind === "register";
+    const known = isWorkEmail(pending.to);
     return (
-      <Card title="Check your email">
+      <Card title="Enter your code" onSubmit={checkCode}>
         <p className="lg-text" role="status">
-          {register ? (
-            <>We sent a link to <strong className="lg-addr">{sent.to}</strong>. Open it on this computer or your phone to confirm your email, then create your password.</>
+          {!known ? (
+            "Enter your work email and the code from your Gate Log email."
+          ) : register ? (
+            <>We emailed a code to <strong className="lg-addr">{pending.to}</strong>. Enter it here to confirm your email, then choose your password.</>
           ) : (
-            <>If <strong className="lg-addr">{sent.to}</strong> has a Gate Log account, a reset link is on its way. Open it on this computer or your phone to choose a new password.</>
+            <>If <strong className="lg-addr">{pending.to}</strong> has a Gate Log account, we emailed it a code. Enter it here to set a new password.</>
           )}
         </p>
-        <p className="lg-hint">Only the newest link works. If nothing arrives within a few minutes, check your junk or spam folder.</p>
+        {!known && (
+          <>
+            <label className="lg-label" htmlFor="lg-email">Work email</label>
+            <EmailInput value={email} onChange={onEmail} invalid={error.field === "email"} autoComplete="email" />
+          </>
+        )}
+        <label className={"lg-label" + (known ? "" : " lg-gap")} htmlFor="lg-code">Code</label>
+        <input
+          id="lg-code"
+          className="lg-input lg-plain lg-code"
+          type="text"
+          name="code"
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          maxLength={14}
+          value={code}
+          onChange={e => { setCode(e.target.value.replace(/[^\d ]/g, "")); clearError(); }}
+          autoFocus={known}
+          aria-invalid={error.field === "code" ? "true" : "false"}
+          aria-describedby={["lg-code-hint", error.field === "code" ? "lg-error" : null].filter(Boolean).join(" ")}
+        />
+        <div id="lg-code-hint" className="lg-hint">Only the newest code works. If nothing arrives within a few minutes, check your junk or spam folder.</div>
         <ErrorLine text={error.text} />
+        <button type="submit" className="lg-submit" disabled={busy}>
+          {busy ? "Checking…" : "Continue"}
+        </button>
         <button
           type="button"
           className="lg-secondary lg-gap"
           disabled={busy || cooldown > 0}
-          onClick={() => sendLink(sent.kind)}
+          onClick={() => sendCode(pending.kind)}
         >
-          {busy ? "Sending…" : cooldown > 0 ? `Send another link in ${cooldown}s` : "Send another link"}
+          {cooldown > 0 ? `Send a new code in ${cooldown}s` : "Send a new code"}
         </button>
         <button type="button" className="lg-back" onClick={() => go("signin")}>Back to sign in</button>
       </Card>
@@ -600,8 +689,8 @@ function AccountForms({ initialNotice }) {
   );
 }
 
-// Shown after someone arrives from an email link: a new account chooses its
-// password here, and a reset sets a new one.
+// Shown after an emailed code (or an older email link) signs someone in: a new
+// account chooses its password here, and a reset sets a new one.
 function PasswordStep({ mode, email, onSaved, onSignOut }) {
   const creating = mode !== "reset";
   const [pw1, setPw1] = useState("");
@@ -819,7 +908,7 @@ const LOGIN_CSS = `
   width: 100%; max-width: 400px; margin: 26px 0 0;
   padding: 2px 4px 0 18px; border-left: 2px solid #f8c700;
 }
-.lg-quote { margin: 0; transition: opacity 0.45s ease, transform 0.45s ease; }
+.lg-quote { margin: 0; transition: opacity 0.6s ease, transform 0.6s ease; }
 .lg-quote.is-out { opacity: 0; transform: translateY(4px); }
 .lg-quote p {
   margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-style: italic;
@@ -892,6 +981,8 @@ const LOGIN_CSS = `
 }
 .lg-back:hover { color: #f4f1ec; text-decoration: underline; }
 .lg-back:focus-visible { outline: 2px solid rgba(248,199,0,0.45); }
+.lg-back-tight { margin-top: 2px; }
+.lg-code { font-size: 20px; letter-spacing: 0.3em; }
 @media (max-width: 900px) { .lg-titleblock { display: none; } }
 @media (max-width: 480px) {
   .lg-card { padding: 24px 18px 20px; }
