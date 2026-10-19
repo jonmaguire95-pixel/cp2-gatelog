@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
 import { supabase, supabaseReady, authStart, writePasswordStep, takeCodeIntent } from "./supabase.js";
 import LoginScreen from "./LoginScreen.jsx";
@@ -500,11 +500,138 @@ function AreaTable({ title, rows, basis, note }) {
 
 const td = { padding:"10px 12px", color:"#c8d6e8", fontSize:13, verticalAlign:"middle" };
 
+// ── SWIPE DETAIL ──────────────────────────────────────────────────────────────
+// Every swipe for each person in the rows a day was analyzed from, in time
+// order, in the compact form stored with a saved day: t (time), g (gate, the
+// Area column), a (In or Out), d (door), e (event), and off (true when the gate
+// was on the off site list at save time; left out otherwise).
+function swipeEntries(rows, nqGates) {
+  const by = new Map();
+  for (const r of rows || []) {
+    const guid = r["CardholderGuid"] || r["Cardholder Guid"] || r["cardholderguid"] || "";
+    const ts = parseDate(r["Event Timestamp"] || r["EventTimestamp"] || "");
+    if (!guid || !ts) continue;
+    const gate = r["Area"] || "";
+    const entry = { t: ts.toISOString(), g: gate, a: r["Access Point"] || "", d: r["Door"] || "", e: r["Event"] || "" };
+    if (nqGates.has(gate)) entry.off = true;
+    const list = by.get(guid);
+    if (list) list.push(entry); else by.set(guid, [entry]);
+  }
+  for (const list of by.values()) list.sort((x, y) => x.t.localeCompare(y.t));
+  return by;
+}
+
+// Times inside a day block: the clock time, with the date in front when the
+// moment falls on another day (a night shift OUT the next morning)
+const asDate = v => (v ? (v instanceof Date ? v : new Date(v)) : null);
+const clockOf = (d, sec) => d.toLocaleTimeString("en-US", sec
+  ? { hour:"numeric", minute:"2-digit", second:"2-digit", hour12:true }
+  : { hour:"numeric", minute:"2-digit", hour12:true });
+const whenIn = (d, ymd, sec) => (toYMD(d) === ymd ? "" : `${d.getMonth() + 1}/${d.getDate()} `) + clockOf(d, sec);
+
+// The rules a saved day was calculated with, in one line
+function ruleLine(rules) {
+  if (!rules) return "";
+  const parts = [rules.roundTo > 0 ? `nearest ${rules.roundTo} min, ${midpointToStr(rules.midpointSec)} midpoint` : "no rounding"];
+  parts.push(rules.lunchMin > 0
+    ? `${rules.lunchMin} min lunch${rules.lunchOverHrs > 0 ? ` only over ${rules.lunchOverHrs} hrs` : ""}`
+    : "no lunch deduction");
+  if (rules.earliestInMin > 0) parts.push(`INs before ${minutesToClock(rules.earliestInMin)} count as ${minutesToClock(rules.earliestInMin)}`);
+  if (rules.inWindowHrs > 0) parts.push(`IN counted only within ${rules.inWindowHrs} hrs of the first badge`);
+  return parts.join(", ");
+}
+
+// How a day's billable time was reached, from the saved result row
+function calcLine(day, ymd) {
+  const rawIn = asDate(day.rawIn), rawOut = asDate(day.rawOut), rndIn = asDate(day.rndIn), rndOut = asDate(day.rndOut);
+  const parts = [
+    rawIn ? `Raw IN ${whenIn(rawIn, ymd, true)} at ${day.inGate || "?"}${rndIn ? ` to ${whenIn(rndIn, ymd, false)}` : ""}` : "Raw IN missing",
+    rawOut ? `Raw OUT ${whenIn(rawOut, ymd, true)} at ${day.outGate || "?"}${rndOut ? ` to ${whenIn(rndOut, ymd, false)}` : ""}` : "Raw OUT missing",
+  ];
+  if (day.billHrs != null) {
+    const lunch = day.rawHrs != null && day.lessLunch != null ? Math.round((day.rawHrs - day.lessLunch) * 60) : 0;
+    parts.push(`elapsed ${decToHM(day.rawHrs)}`);
+    parts.push(lunch > 0 ? `less ${lunch} min lunch ${decToHM(day.lessLunch)}` : `no lunch deducted ${decToHM(day.lessLunch)}`);
+    parts.push(`billable ${decToHM(day.billHrs)}`);
+  } else if (rawIn && rawOut && REVIEW_STATUSES.has(day.status)) {
+    parts.push("hours left blank for review");
+  } else {
+    parts.push("no hours counted");
+  }
+  return parts.join("; ");
+}
+
+const mutedLine = { fontSize:11, color:"#6b7a8d", lineHeight:1.5 };
+const badLine = { fontSize:11, color:"#f87171", lineHeight:1.5 };
+
+// The swipes under a day: time, gate, direction, with the IN and OUT that were
+// counted marked. swipes is the stored list, null when none were saved.
+function SwipeList({ swipes, ymd, day, state, error }) {
+  if (state === "loading") return <div style={mutedLine}>Loading swipe detail</div>;
+  if (state === "error") return <div data-testid="swipes-error" style={badLine}>Swipe detail could not be loaded: {error}</div>;
+  if (!swipes) return <div data-testid="swipes-missing" style={mutedLine}>Swipe detail was not saved for this day. Save the day again to add it.</div>;
+  if (!swipes.length) return <div style={mutedLine}>No swipes.</div>;
+  const rawIn = asDate(day && day.rawIn), rawOut = asDate(day && day.rawOut);
+  let inDone = false, outDone = false;
+  const cell = { padding:"3px 8px", fontSize:11, fontFamily:"'DM Mono',monospace", whiteSpace:"nowrap", verticalAlign:"middle" };
+  const hd = { ...cell, color:"#4b5e7a", textTransform:"uppercase", letterSpacing:0.8, fontSize:9, fontWeight:600, textAlign:"left" };
+  return (
+    <div style={{ overflowX:"auto" }}>
+      <table data-testid="swipe-list" style={{ borderCollapse:"collapse", marginTop:4 }}>
+        <thead>
+          <tr style={{ borderBottom:"1px solid #1a2535" }}>
+            <th style={hd}>Time</th><th style={hd}>Gate</th><th style={hd}>Direction</th><th style={hd}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {swipes.map((s, i) => {
+            const d = new Date(s.t);
+            const countedIn = !inDone && s.a === "In" && rawIn && d.getTime() === rawIn.getTime() && s.g === day.inGate;
+            const countedOut = !outDone && s.a === "Out" && rawOut && d.getTime() === rawOut.getTime() && s.g === day.outGate;
+            if (countedIn) inDone = true;
+            if (countedOut) outDone = true;
+            const counted = countedIn || countedOut;
+            return (
+              <tr key={i} data-counted={countedIn ? "in" : countedOut ? "out" : undefined}
+                style={{ background: counted ? "#0d2a1a" : "transparent", color: s.off ? "#6b7a8d" : "#c8d6e8" }}>
+                <td style={cell}>{whenIn(d, ymd, true)}</td>
+                <td style={{ ...cell, whiteSpace:"normal", minWidth:140 }}>
+                  {s.g}
+                  {s.off && <span style={{ marginLeft:6, fontSize:9, color:"#fb923c", letterSpacing:0.5 }}>OFF SITE</span>}
+                </td>
+                <td style={{ ...cell, color: s.a === "In" ? "#4ade80" : s.a === "Out" ? "#f87171" : "#c8d6e8" }}>
+                  {s.a === "In" ? "IN" : s.a === "Out" ? "OUT" : s.a}
+                </td>
+                <td style={{ ...cell, fontSize:9, letterSpacing:0.5, color:"#34d399", fontWeight:700 }}>
+                  {countedIn ? "COUNTED IN" : countedOut ? "COUNTED OUT" : ""}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ── ROW: touch safe expand ───────────────────────────────────────────────────
-function Row({ r, idx, showRoster, showScope }) {
+// swipes: the person's swipes for a fresh upload (from the rows in memory).
+// loadSwipes: fetches them for a day loaded from History.
+function Row({ r, idx, showRoster, showScope, shiftDate, swipes, loadSwipes }) {
   const [open, setOpen] = useState(false);
+  const [fetched, setFetched] = useState(null); // swipe detail for a loaded day
   const isIssue = r.status !== "Clean";
   const isReview = REVIEW_STATUSES.has(r.status) && r.status !== "Over 13 Hrs";
+
+  useEffect(() => {
+    if (!open || swipes !== undefined || !loadSwipes || fetched) return;
+    let alive = true;
+    setFetched({ state: "loading" });
+    loadSwipes(r.guid).then(res => {
+      if (alive) setFetched({ state: res.error ? "error" : "ready", swipes: res.swipes, error: res.error });
+    });
+    return () => { alive = false; };
+  }, [open]);
 
   // iOS fix: use onTouchEnd to toggle so the expand works even when
   // the scroll container intercepts the onClick event
@@ -607,12 +734,136 @@ function Row({ r, idx, showRoster, showScope }) {
                 </div>
               ))}
             </div>
+            {/* Every swipe for this person in the data the day was read from */}
+            <div data-testid="row-swipes" style={{ marginTop:10 }}>
+              <div style={{ color:"#4b5e7a", fontSize:10, textTransform:"uppercase", letterSpacing:1, marginBottom:3 }}>
+                Badge swipes
+              </div>
+              <SwipeList
+                swipes={swipes !== undefined ? swipes : fetched && fetched.state === "ready" ? fetched.swipes : null}
+                ymd={shiftDate} day={r}
+                state={swipes !== undefined ? "ready" : fetched ? fetched.state : "ready"}
+                error={fetched && fetched.error}
+              />
+            </div>
           </td>
         </tr>
       )}
     </>
   );
 }
+
+// ── WEEK ROW: one person across the selected days ────────────────────────────
+// Opens like the daily Row. The panel shows how the week total adds up, then a
+// block for each day with its calculation, the rules it was saved with, and
+// every swipe. The swipes are fetched the first time the row opens.
+function WeekRow({ e, idx, dates, dayInfo, showRoster, showScope, fmtD, loadSwipes }) {
+  const [open, setOpen] = useState(false);
+  const [sw, setSw] = useState(null); // { state, byReport, error }
+
+  const handleToggle = useCallback((ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    setOpen(o => !o);
+  }, []);
+
+  useEffect(() => {
+    if (!open || sw) return;
+    let alive = true;
+    setSw({ state: "loading", byReport: {} });
+    const ids = dates.map(d => dayInfo[d] && dayInfo[d].reportId).filter(Boolean);
+    loadSwipes(e.guid, ids).then(res => {
+      if (alive) setSw({ state: res.error ? "error" : "ready", byReport: res.byReport || {}, error: res.error });
+    });
+    return () => { alive = false; };
+  }, [open]);
+
+  const colSpan = 5 + dates.length + (showRoster ? (showScope ? 3 : 2) : 0);
+  const worked = dates.filter(d => e.days[d]);
+  const terms = worked.map(d => {
+    const day = e.days[d];
+    return day.billHrs != null ? decToHM(day.billHrs) : `0:00 (${dayLabel(d)}, ${day.status === "Clean" ? "no hours" : day.status})`;
+  });
+  const weekLine = `Days worked ${e.daysWorked}, Issue days ${e.issueDays}, Total ${decToHM(e.total)}` +
+    (terms.length ? ` = ${terms.join(" + ")}` : "");
+
+  return (
+    <>
+      <tr
+        onClick={handleToggle}
+        onTouchEnd={handleToggle}
+        style={{ borderBottom:"1px solid #1a2535", cursor:"pointer", WebkitTapHighlightColor:"transparent",
+          background: i2(idx) }}>
+        <td style={{ ...td, whiteSpace:"nowrap" }}>{e.name}</td>
+        <td style={{ ...td, color:"#6b7a8d" }}>{e.company}</td>
+        <td style={{ ...td, color:"#6b7a8d", fontFamily:"'DM Mono',monospace" }}>{e.ein}</td>
+        {showRoster && (<>
+          <td style={{ ...td, fontSize:12, whiteSpace:"nowrap" }}>{e.notInRoster || e.supervisor === "N/A" ? "" : e.supervisor}</td>
+          <td style={{ ...td, fontSize:12, color: e.notInRoster ? "#f59e0b" : "#c8d6e8", whiteSpace:"nowrap" }}>
+            {e.notInRoster ? "Not in roster" : e.area === "N/A" ? "" : e.area}</td>
+          {showScope && <td style={{ ...td, fontSize:12 }}>{e.notInRoster || e.scope === "N/A" ? "" : e.scope}</td>}
+        </>)}
+        {dates.map(d => {
+          const day = e.days[d];
+          const review = day && day.billHrs == null && (day.status === "Late IN" || day.status === "Late OUT");
+          return (
+            <td key={d} title={day && day.note ? day.note : undefined} style={{ ...td, fontFamily:"'DM Mono',monospace", fontSize:12,
+              whiteSpace:"nowrap",
+              color: !day ? "#374151" : review ? "#facc15" : day.billHrs == null && day.status !== "Clean" ? "#ef4444"
+                : day.over13 ? "#fb923c" : day.status === "Split Shift" ? "#facc15" : "#c8d6e8" }}>
+              {dayCell(day)}
+            </td>
+          );
+        })}
+        <td style={{ ...td, fontFamily:"'DM Mono',monospace" }}>{e.daysWorked}</td>
+        <td style={{ ...td, fontFamily:"'DM Mono',monospace", fontWeight:700, color:"#e2e8f0" }}>
+          {decToHM(e.total)}
+        </td>
+      </tr>
+
+      {open && (
+        <tr style={{ background:"#060d16", borderBottom:"1px solid #1a2535" }}>
+          <td colSpan={colSpan} style={{ padding:"12px 14px" }}>
+            <div data-testid="week-line" style={{ fontSize:12, color:"#e2e8f0", fontFamily:"'DM Mono',monospace",
+              marginBottom:10, lineHeight:1.6 }}>{weekLine}</div>
+            {dates.map(d => {
+              const day = e.days[d];
+              const info = dayInfo[d] || {};
+              const swipes = sw && sw.state === "ready" ? sw.byReport[info.reportId] : null;
+              return (
+                <div key={d} data-testid="week-day" style={{ background:"#0d1520", border:"1px solid #1a2535", borderRadius:6,
+                  padding:"8px 10px", marginBottom:8 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                    <span style={{ fontSize:12, fontWeight:700, color:"#e2e8f0", fontFamily:"'DM Mono',monospace" }}>{fmtD(d)}</span>
+                    {day ? <Badge status={day.status} /> : <span style={{ fontSize:11, color:"#4b5e7a" }}>No badge activity</span>}
+                  </div>
+                  {day && day.note && (
+                    <div style={{ background:"#1d1a0a", border:"1px solid #a16207", borderRadius:6,
+                      padding:"6px 8px", marginTop:6, color:"#fde68a", fontSize:11, lineHeight:1.5 }}>{day.note}</div>
+                  )}
+                  {day && (
+                    <div data-testid="calc-line" style={{ marginTop:6, fontSize:11, color:"#c8d6e8", fontFamily:"'DM Mono',monospace", lineHeight:1.6 }}>
+                      {calcLine(day, d)}
+                    </div>
+                  )}
+                  {day && info.rules && (
+                    <div data-testid="rule-line" style={{ ...mutedLine, fontFamily:"'DM Mono',monospace" }}>Rules: {ruleLine(info.rules)}</div>
+                  )}
+                  {day && (
+                    <div style={{ marginTop:6 }}>
+                      <SwipeList swipes={swipes} ymd={d} day={day} state={sw ? sw.state : "loading"} error={sw && sw.error} />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+const i2 = idx => (idx % 2 === 0 ? "#0d1520" : "#0a1118");
 
 // ── SAVED COPIES ──────────────────────────────────────────────────────────────
 // A day's headline numbers, to compare a new upload with a copy already saved
@@ -753,12 +1004,27 @@ export default function App() {
   // ── Weekly rollup state ──
   const [weeklyReports, setWeeklyReports] = useState([]); // report metadata rows
   const [selIds, setSelIds]         = useState(new Set());
-  const [rollup, setRollup]         = useState(null); // {emps, dates}
+  const [rollup, setRollup]         = useState(null); // {emps, dates, dayCounts, dayInfo}
   const [rollupMeta, setRollupMeta] = useState([]);   // day meta for selected reports
   const [weeklyMsg, setWeeklyMsg]   = useState("");
-  const [weeklyNote, setWeeklyNote] = useState("");   // which week opened after a save
+  const [weeklyNote, setWeeklyNote] = useState("");   // which week the control stands on, and what is not saved yet
   const [weeklySearch, setWeeklySearch] = useState("");
   const [weeklyBusy, setWeeklyBusy] = useState(false);
+  // The Monday of the week the week control stands on
+  const [weekMon, setWeekMon]       = useState(() => weekStart(toYMD(new Date())));
+  const [panelOpen, setPanelOpen]   = useState(true);  // the saved days panel
+  const [showFiles, setShowFiles]   = useState(false); // file names in the saved days panel
+
+  // ── Swipe detail ──
+  // The rows the open day was read from, so Save can store every swipe and the
+  // report screen can show them. Null for a day loaded from History, whose
+  // swipes come from the database (loadedReportId).
+  const [dayRows, setDayRows]       = useState(null);  // { rows, nqGates }
+  const [loadedReportId, setLoadedReportId] = useState(null);
+  const swipesByGuid = useMemo(() => (dayRows ? swipeEntries(dayRows.rows, dayRows.nqGates) : null), [dayRows]);
+  // Swipes already fetched this session: "reportId|guid" to the list, or null
+  // when that saved day has no swipe rows for the person
+  const swipeCache = useRef(new Map());
 
   // ── Employee roster state ──
   const [roster, setRoster]         = useState([]); // [{ein, firstName, lastName, supervisor, area, scope}]
@@ -989,6 +1255,8 @@ export default function App() {
         setReportDate(rd);
       }
       setResults(analyze(rows, sd, rd, nqGates, rules));
+      setDayRows({ rows, nqGates });
+      setLoadedReportId(null);
       setScreen("results");
     } catch (err) {
       setError("Error: " + err.message);
@@ -1189,14 +1457,21 @@ export default function App() {
   // ── Supabase save / load handlers ──
   // Writes the columns that actually exist in the reports table
   // (the old build wrote shifts_count/issues_count, which don't, so every save failed).
-  const saveReport = async (res, sDate, rDate, fname) => {
+  // results_json also keeps the rules and the off site gate list the day was
+  // calculated with, so the calculation can be explained later.
+  // After the report row, every person's swipes go into report_swipes in
+  // batches. If a batch fails the report row stays, the day is left with no
+  // swipe rows at all, and the problem comes back as the note for the status
+  // line ("" when everything was stored).
+  const SWIPE_BATCH = 500;
+  const saveReport = async (res, sDate, rDate, fname, rows, nqGates) => {
     const totalBillHrs = res.reduce((s, r) => s + (r.billHrs || 0), 0);
-    const { error } = await supabase.from("reports").insert({
+    const { data, error } = await supabase.from("reports").insert({
       shift_date: sDate,
       report_date: rDate,
       uploaded_by: uploadedBy.trim(),
       file_name: fname || null,
-      results_json: { results: res, shiftDate: sDate, reportDate: rDate },
+      results_json: { results: res, shiftDate: sDate, reportDate: rDate, rules, nqGates: [...(nqGates || [])].sort() },
       raw_csv_path: null,
       total_workers: res.length,
       clean_count:  res.filter(r => r.status === "Clean").length,
@@ -1205,8 +1480,50 @@ export default function App() {
       missing_both: res.filter(r => r.status === "Missing IN & OUT").length,
       over_13:      res.filter(r => r.over13).length,
       total_bill_hrs: Math.round(totalBillHrs * 100) / 100,
-    });
+    }).select("id").single();
     if (error) throw error;
+    const reportId = data && data.id;
+    if (!reportId) return "the saved report returned no id";
+    if (!rows) return "";
+    const entries = swipeEntries(rows, nqGates || new Set());
+    const swipeRows = res.map(r => ({ report_id: reportId, guid: r.guid, ein: r.ein || null, swipes: entries.get(r.guid) || [] }));
+    for (let i = 0; i < swipeRows.length; i += SWIPE_BATCH) {
+      const { error: swErr } = await supabase.from("report_swipes").insert(swipeRows.slice(i, i + SWIPE_BATCH));
+      if (swErr) {
+        try { await supabase.from("report_swipes").delete().eq("report_id", reportId); } catch (_) { /* best effort */ }
+        return swErr.message || "unknown error";
+      }
+    }
+    return "";
+  };
+
+  // Swipe detail for one person across saved days, fetched once per person
+  // and day for the session. Returns { byReport: { reportId: list or null }, error }.
+  const loadSwipes = async (guid, reportIds) => {
+    const byReport = {};
+    const need = [];
+    for (const id of reportIds || []) {
+      const k = `${id}|${guid}`;
+      if (swipeCache.current.has(k)) byReport[id] = swipeCache.current.get(k); else need.push(id);
+    }
+    if (need.length) {
+      if (!supabaseReady()) return { byReport, error: "Database not configured." };
+      const { data, error } = await supabase.from("report_swipes").select("report_id, swipes").eq("guid", guid).in("report_id", need);
+      if (error) return { byReport, error: error.message };
+      const got = {};
+      for (const row of data || []) got[row.report_id] = Array.isArray(row.swipes) ? row.swipes : [];
+      for (const id of need) {
+        const v = got[id] === undefined ? null : got[id];
+        swipeCache.current.set(`${id}|${guid}`, v);
+        byReport[id] = v;
+      }
+    }
+    return { byReport };
+  };
+  // The daily screen's version, for a day loaded from History
+  const loadDaySwipes = async (guid) => {
+    const res = await loadSwipes(guid, [loadedReportId]);
+    return { swipes: res.byReport[loadedReportId], error: res.error };
   };
 
   // Every saved report for each shift date, newest first
@@ -1252,13 +1569,14 @@ export default function App() {
         if (error) throw error;
         if (data && data.length) { setResaveAsk({ existing: data, date: shiftDate }); return; }
       }
-      await saveReport(results, shiftDate, reportDate, fileName);
+      const swipeNote = await saveReport(results, shiftDate, reportDate, fileName, dayRows && dayRows.rows, dayRows ? dayRows.nqGates : currentGates());
       const note = !existing || !existing.length ? ""
         : choice === "replace" ? await removeCopies(existing)
         : existing.length === 1 ? ". Kept the earlier copy too" : `. Kept the ${existing.length} earlier copies too`;
       setResaveAsk(null);
       setSavedResults(results);
-      setSaveMsg("Saved" + (note || ".") + (note && !note.endsWith(".") ? "." : ""));
+      const head = swipeNote ? `Saved, but the swipe detail could not be stored: ${swipeNote}` : "Saved";
+      setSaveMsg(head + (note || ".") + (note && !note.endsWith(".") ? "." : ""));
       loadSavedCopies();
     } catch (e) {
       setSaveMsg("Save error: " + e.message);
@@ -1287,11 +1605,12 @@ export default function App() {
       if (copies.length && f.dup === "skip") { out.push({ ...f, status: "Skipped: already saved" }); continue; }
       try {
         const res = analyze(f.rows, f.shiftDate, f.reportDate, nqGates, rules);
-        await saveReport(res, f.shiftDate, f.reportDate, f.name);
+        const swipeNote = await saveReport(res, f.shiftDate, f.reportDate, f.name, f.rows, nqGates);
         const note = !copies.length ? ""
           : f.dup !== "keep" ? await removeCopies(copies)
           : copies.length === 1 ? ". Kept the earlier copy too" : `. Kept the ${copies.length} earlier copies too`;
-        out.push({ ...f, status: `Saved: ${res.length} workers, ${decToHM(res.reduce((s, r) => s + (r.billHrs || 0), 0))} hrs${note}` });
+        out.push({ ...f, status: `Saved: ${res.length} workers, ${decToHM(res.reduce((s, r) => s + (r.billHrs || 0), 0))} hrs${note}` +
+          (swipeNote ? `. Swipe detail could not be stored: ${swipeNote}` : "") });
       } catch (e) {
         out.push({ ...f, status: "Save error: " + e.message });
       }
@@ -1440,12 +1759,19 @@ export default function App() {
     ]));
     if (payload.shiftDate) setShiftDate(payload.shiftDate);
     if (payload.reportDate) setReportDate(payload.reportDate);
+    // A day from History is already saved: its swipe detail is read from the
+    // database, and Save stays locked so a copy without swipes can't replace it
+    setDayRows(null);
+    setLoadedReportId(id);
+    setSavedResults(revived);
     setScreen("results");
   };
 
   // ── Weekly rollup handlers ──
-  // Loads the saved report list and opens the weekly screen. Returns the list
-  // so a caller can pick days from it straight away.
+  // Loads the saved report list and opens the weekly screen. The week control
+  // stands on the newest week with a saved day (the current calendar week when
+  // nothing is saved), and that week's days are picked when nothing is picked
+  // yet. Returns the list so a caller can pick days from it straight away.
   const loadWeekly = async () => {
     setWeeklyMsg("");
     setWeeklyNote("");
@@ -1457,10 +1783,15 @@ export default function App() {
       .order("shift_date", { ascending: false })
       .limit(200);
     if (error) { setWeeklyMsg("Load error: " + error.message); }
-    setWeeklyReports(data || []);
+    const reports = data || [];
+    setWeeklyReports(reports);
     setRollup(null);
+    setPanelOpen(true);
+    const newest = reports.reduce((m, r) => { const w = weekStart(r.shift_date); return !m || w > m ? w : m; }, null);
+    const mon = newest || weekStart(toYMD(new Date()));
+    if (selIds.size) setWeekMon(mon); else standOnWeek(mon, reports);
     setScreen("weekly");
-    return data || [];
+    return reports;
   };
 
   const toggleSel = (id) => {
@@ -1470,23 +1801,39 @@ export default function App() {
       return next;
     });
     setRollup(null);
-    setWeeklyNote("");
   };
 
   // Every saved day in the list, the newest copy of a day saved twice
   const selectAll = () => {
     setSelIds(new Set(newestPerDate(weeklyReports).map(r => r.id)));
     setRollup(null);
-    setWeeklyNote("");
   };
 
-  // Quick select a Monday to Sunday week: 0 = this week, -1 = last week
-  const selectWeek = (offset) => {
-    const days = weekDays(toYMD(addDays(new Date(weekStart(toYMD(new Date())) + "T00:00:00"), offset * 7)));
-    setSelIds(new Set(newestPerDate(weeklyReports, days).map(r => r.id)));
-    setRollup(null);
-    setWeeklyNote("");
+  // Puts the week control on a Monday to Sunday week (by shift date), picks the
+  // newest saved copy of each day of that week, and names the days of the week
+  // with nothing saved. Returns the picked ids.
+  const standOnWeek = (mon, reports, extraNotes = []) => {
+    const days = weekDays(mon);
+    const inWeek = newestPerDate(reports, days);
+    const ids = new Set(inWeek.map(r => r.id));
+    setWeekMon(mon);
+    setSelIds(ids);
+    const have = new Set(inWeek.map(r => r.shift_date));
+    const missing = days.filter(d => !have.has(d));
+    const notes = [`Week of ${dayLabel(days[0])} to ${dayLabel(days[6])}.`];
+    if (missing.length) notes.push(`Not saved yet: ${missing.map(dayLabel).join(", ")}.`);
+    setWeeklyNote(notes.concat(extraNotes).join(" "));
+    return ids;
   };
+
+  // The week button and its arrows: stand on the week and build in one step
+  const openWeek = async (mon, reports = weeklyReports, extraNotes = []) => {
+    setWeeklyMsg("");
+    const ids = standOnWeek(mon, reports, extraNotes);
+    if (!ids.size) { setRollup(null); return; }
+    await buildRollupFor(ids, reports);
+  };
+  const shiftWeek = (n) => openWeek(toYMD(addDays(new Date(weekMon + "T00:00:00"), n * 7)));
 
   // After a bulk save: open the rollup on the Monday to Sunday week (by shift
   // date) holding most of the days just saved, with the newest saved report
@@ -1500,17 +1847,8 @@ export default function App() {
     for (const d of savedDates) { const m = weekStart(d); count[m] = (count[m] || 0) + 1; }
     const mon = Object.keys(count).sort((a, b) => count[b] - count[a] || b.localeCompare(a))[0];
     const days = weekDays(mon);
-    const inWeek = newestPerDate(reports, days);
-    const ids = new Set(inWeek.map(r => r.id));
-    setSelIds(ids);
-    const have = new Set(inWeek.map(r => r.shift_date));
-    const missing = days.filter(d => !have.has(d));
     const other = [...new Set(savedDates.filter(d => !days.includes(d)))].sort();
-    const notes = [`Week of ${dayLabel(days[0])} to ${dayLabel(days[6])}.`];
-    if (missing.length) notes.push(`Not saved yet: ${missing.map(dayLabel).join(", ")}.`);
-    if (other.length) notes.push(`Also saved, in another week: ${other.map(dayLabel).join(", ")}.`);
-    setWeeklyNote(notes.join(" "));
-    await buildRollupFor(ids, reports);
+    await openWeek(mon, reports, other.length ? [`Also saved, in another week: ${other.map(dayLabel).join(", ")}.`] : []);
   };
 
   const buildRollup = () => buildRollupFor(selIds, weeklyReports);
@@ -1531,17 +1869,24 @@ export default function App() {
       const sorted = newestPerDate(data || []).sort((a, b) => a.shift_date.localeCompare(b.shift_date));
       const byEmp = {};
       const dayCounts = {};
+      const dayInfo = {};   // per date: the saved report, and the rules and off site gates it was calculated with
       const dates = [...new Set(sorted.map(r => r.shift_date))].sort();
       for (const rep of sorted) {
-        const res = (rep.results_json && rep.results_json.results) || [];
+        const rj = rep.results_json || {};
+        const res = rj.results || [];
         dayCounts[rep.shift_date] = statusCounts(res);
+        dayInfo[rep.shift_date] = { reportId: rep.id, rules: rj.rules || null, nqGates: Array.isArray(rj.nqGates) ? rj.nqGates : null };
         for (const r of res) {
           const key = r.guid || `${r.ein}|${r.name}`;
           const e = byEmp[key] || (byEmp[key] = {
-            name: r.name || "", company: r.company || "", ein: r.ein || "",
+            guid: r.guid || "", name: r.name || "", company: r.company || "", ein: r.ein || "",
             days: {}, daysWorked: 0, issueDays: 0, total: 0,
           });
-          e.days[rep.shift_date] = { billHrs: r.billHrs, status: r.status, over13: r.over13, flagArea: gateFlagArea(r), note: r.note || "" };
+          e.days[rep.shift_date] = {
+            billHrs: r.billHrs, status: r.status, over13: r.over13, flagArea: gateFlagArea(r), note: r.note || "",
+            rawIn: r.rawIn || null, rawOut: r.rawOut || null, rndIn: r.rndIn || null, rndOut: r.rndOut || null,
+            inGate: r.inGate || "", outGate: r.outGate || "", rawHrs: r.rawHrs ?? null, lessLunch: r.lessLunch ?? null,
+          };
         }
       }
       const emps = Object.values(byEmp).map(e => {
@@ -1552,8 +1897,9 @@ export default function App() {
         }
         return { ...e, daysWorked, issueDays, total };
       }).sort((a, b) => a.name.localeCompare(b.name));
-      setRollup({ emps, dates, dayCounts });
+      setRollup({ emps, dates, dayCounts, dayInfo });
       setRollupMeta(newestPerDate(chosen).sort((a, b) => a.shift_date.localeCompare(b.shift_date)));
+      setPanelOpen(false);
     } catch (e) {
       setWeeklyMsg("Rollup error: " + e.message);
     } finally {
@@ -1569,6 +1915,7 @@ export default function App() {
     writePasswordStep(null);
     setSession(null); setPwStep(null);
     setResults([]); setFileName(""); setScreen("upload");
+    setDayRows(null); setLoadedReportId(null); swipeCache.current.clear();
     setHistory([]); setWeeklyReports([]); setRollup(null); setSelIds(new Set());
     setRoster([]); setRosterMeta(null); setUploadedBy("");
   };
@@ -1604,6 +1951,7 @@ export default function App() {
   const goUpload = () => {
     setMenuOpen(false);
     setScreen("upload"); setResults([]); setFileName(""); setBulkFiles([]);
+    setDayRows(null); setLoadedReportId(null);
   };
   const openConfig = () => {
     setMenuOpen(false);
@@ -1612,7 +1960,16 @@ export default function App() {
   };
   const dayOpen = results.length > 0 && (screen === "results" || screen === "absent");
   const savedThis = savedResults === results && results.length > 0;
-  // Fonts, box sizing and the small screen button size, on every screen
+  // Header buttons: plain text, one height
+  const hbtn = (active, color = "#334155") => ({
+    ...btn(active, color), height:32, display:"inline-flex", alignItems:"center", justifyContent:"center",
+  });
+  // Fonts, box sizing and the small screen button size, on every screen.
+  // The header is one row from 960 px up: the logo on the left, the day's
+  // buttons, the main buttons and the menu on the right, so the main buttons
+  // sit in the same place whatever else is showing. Below 960 px it is two
+  // rows: the logo and the menu, then the main buttons followed by the day's
+  // buttons (which wrap under them on a narrow phone).
   const pageHeader = (<>
     <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
@@ -1623,19 +1980,32 @@ export default function App() {
         ::-webkit-scrollbar-track { background:#060d16; }
         ::-webkit-scrollbar-thumb { background:#1a2d45; border-radius:3px; }
         .gl-note::after { content:"ⓘ"; color:#6b7a8d; font-size:11px; margin-left:6px; }
+        .gl-hdr { display:flex; align-items:center; justify-content:space-between; flex-wrap:nowrap; column-gap:10px; row-gap:8px; }
+        .gl-hdr-logo { order:0; flex-shrink:0; }
+        .gl-hdr-right { order:1; display:flex; gap:6px; align-items:center; justify-content:flex-end; flex:1 1 auto; min-width:0; }
+        .gl-hdr-day, .gl-hdr-main { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+        .gl-hdr-day { order:0; justify-content:flex-end; }
+        .gl-hdr-main { order:1; justify-content:flex-end; }
+        .gl-hdr-menu { order:2; position:relative; flex-shrink:0; }
+        @media (max-width: 959px) {
+          .gl-hdr { flex-wrap:wrap; }
+          .gl-hdr-menu { order:1; }
+          .gl-hdr-right { order:2; flex:1 1 100%; justify-content:flex-start; flex-wrap:wrap; }
+          .gl-hdr-main { order:0; justify-content:flex-start; }
+          .gl-hdr-day { order:1; justify-content:flex-start; }
+        }
         @media (max-width: 480px) {
           /* On small screens the stat cards go 4-up then 3-up naturally via flex-wrap */
           /* Ensure filter buttons don't overflow */
           button { font-size: 11px !important; padding: 5px 10px !important; }
         }
     `}</style>
-    <div data-testid="page-header" style={{
+    <div data-testid="page-header" className="gl-hdr" style={{
       background:"#0a1320", borderBottom:"1px solid #1a2535",
-      padding:"8px 16px", display:"flex", flexWrap:"wrap", alignItems:"center", rowGap:8, columnGap:10,
-      justifyContent:"space-between", minHeight:52, boxSizing:"border-box", position:"sticky", top:0, zIndex:30,
+      padding:"8px 16px", minHeight:52, boxSizing:"border-box", position:"sticky", top:0, zIndex:30,
       margin: onMain ? 0 : "-20px -20px 16px",
     }}>
-      <div style={{ display:"flex", alignItems:"center", gap:10, flexShrink:0 }}>
+      <div className="gl-hdr-logo" style={{ display:"flex", alignItems:"center", gap:10 }}>
         <div style={{
           background:"linear-gradient(135deg,#1d4ed8,#0ea5e9)",
           width:30, height:30, borderRadius:7,
@@ -1647,49 +2017,45 @@ export default function App() {
           <div style={{ fontSize:9, color:"#4b5e7a", letterSpacing:1, textTransform:"uppercase" }}>MMR Constructors</div>
         </div>
       </div>
-      {/* wrap-reverse keeps the main buttons on the top line when a phone
-          screen pushes the report buttons onto a line of their own */}
-      <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap-reverse", justifyContent:"flex-end", flex:"1 1 auto" }}>
-        {dayOpen && (<div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap", justifyContent:"flex-end" }}>
-          <button onClick={handleExport} style={{
-            ...btn(true, "#1d4ed8"), background:"#1d4ed8", color:"#fff",
-          }}>↓ Excel</button>
+      <div className="gl-hdr-right">
+        {dayOpen && (<div className="gl-hdr-day" data-testid="day-buttons">
+          <button onClick={handleExport} style={{ ...hbtn(true, "#1d4ed8"), background:"#1d4ed8", color:"#fff" }}>Excel</button>
           <button onClick={() => handleSave()} disabled={saveBusy || savedThis}
-            style={{ ...btn(false, "#334155"), cursor: saveBusy || savedThis ? "default" : "pointer", opacity: saveBusy || savedThis ? 0.75 : 1 }}
+            style={{ ...hbtn(false), cursor: saveBusy || savedThis ? "default" : "pointer", opacity: saveBusy || savedThis ? 0.75 : 1 }}
             title={savedThis ? "This report is saved" : "Save to history"}>
-            {savedThis ? "✓ Saved" : saveBusy ? "Saving…" : "💾 Save"}
+            {savedThis ? "Saved" : saveBusy ? "Saving" : "Save"}
           </button>
           {roster.length > 0 && (
             <button
               onClick={() => setScreen("absent")}
               style={{
-                ...btn(screen === "absent", "#334155"),
+                ...hbtn(screen === "absent"),
                 color: absentEmployees.length > 0 ? "#f87171" : "#4b5e7a",
                 borderColor: absentEmployees.length > 0 ? "#7f1d1d" : "#1a2d45",
               }}
               title="Show absent employees"
-            >🚫 Absent {absentEmployees.length > 0 ? `(${absentEmployees.length})` : ""}</button>
+            >Absent{absentEmployees.length > 0 ? ` (${absentEmployees.length})` : ""}</button>
           )}
         </div>)}
-        <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap", justifyContent:"flex-end" }}>
-        <button onClick={() => { if (screen !== "weekly") loadWeekly(); }} style={btn(screen === "weekly", "#334155")}>📅 Weekly</button>
-        <button onClick={openConfig} style={btn(onMain && showConfig, "#334155")}>⚙ Config</button>
-        <button onClick={goUpload} style={btn(screen === "upload", "#334155")} title="Back to the file upload box">File Upload Box</button>
-        <div style={{ position:"relative" }}>
-          <button onClick={() => setMenuOpen(o => !o)} style={btn(false, "#334155")} aria-label="Menu">≡</button>
-          {menuOpen && (
-            <div style={{ position:"absolute", right:0, top:34, background:"#0a1320",
-              border:"1px solid #1a2535", borderRadius:8, padding:6, minWidth:200, zIndex:40 }}>
-              <div style={{ padding:"4px 6px 8px", fontSize:10, color:"#4b5e7a", lineHeight:1.5, wordBreak:"break-all" }}>
-                Signed in as<br /><span style={{ color:"#c8d6e8", fontSize:11 }}>{accountEmail}</span>
-              </div>
-              <button onClick={loadHistory} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>History</button>
-              <button onClick={loadWeekly} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>Weekly Rollup</button>
-              <button onClick={handleLogout} style={{ ...btn(false, "#334155"), width:"100%", color:"#ef4444", borderColor:"#7f1d1d" }}>Logout</button>
+        <div className="gl-hdr-main" data-testid="main-buttons">
+          <button onClick={() => { if (screen !== "weekly") loadWeekly(); }} style={hbtn(screen === "weekly")}>Weekly</button>
+          <button onClick={openConfig} style={hbtn(onMain && showConfig)}>Config</button>
+          <button onClick={goUpload} style={hbtn(screen === "upload")} title="Back to the file upload box">File Upload Box</button>
+        </div>
+      </div>
+      <div className="gl-hdr-menu">
+        <button onClick={() => setMenuOpen(o => !o)} style={hbtn(menuOpen)} aria-label="Menu" aria-expanded={menuOpen}>Menu</button>
+        {menuOpen && (
+          <div style={{ position:"absolute", right:0, top:36, background:"#0a1320",
+            border:"1px solid #1a2535", borderRadius:8, padding:6, minWidth:200, zIndex:40 }}>
+            <div style={{ padding:"4px 6px 8px", fontSize:10, color:"#4b5e7a", lineHeight:1.5, wordBreak:"break-all" }}>
+              Signed in as<br /><span style={{ color:"#c8d6e8", fontSize:11 }}>{accountEmail}</span>
             </div>
-          )}
-        </div>
-        </div>
+            <button onClick={loadHistory} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>History</button>
+            <button onClick={loadWeekly} style={{ ...btn(false, "#334155"), width:"100%", marginBottom:4 }}>Weekly Rollup</button>
+            <button onClick={handleLogout} style={{ ...btn(false, "#334155"), width:"100%", color:"#ef4444", borderColor:"#7f1d1d" }}>Logout</button>
+          </div>
+        )}
       </div>
     </div>
   </>);
@@ -1952,10 +2318,6 @@ export default function App() {
     const dateCounts = {};
     selReports.forEach(r => { dateCounts[r.shift_date] = (dateCounts[r.shift_date] || 0) + 1; });
     const dupSelected = Object.values(dateCounts).some(n => n > 1);
-    // Selected days that fall in more than one Monday to Sunday week
-    const selWeeks = {};
-    selReports.forEach(r => { (selWeeks[weekStart(r.shift_date)] ||= new Set()).add(r.shift_date); });
-    const weekKeys = Object.keys(selWeeks).sort();
     const fmtD = d => `${weekdayOf(d)} ${d.slice(5,7)}/${d.slice(8,10)}`;
     const showRosterCols = roster.length > 0;
     const sharedWeek = rollup ? sharedIds(rollup.emps) : new Set();
@@ -1972,73 +2334,118 @@ export default function App() {
           rollup.emps.flatMap(e => Object.values(e.days).map(d => ({ status: d.status, flagArea: d.flagArea, ein: e.ein, name: e.name }))),
           areaOfWith(sharedWeek))
       : [];
+    // The week on the control, and how the selection compares with it: days
+    // picked outside it, and saved days of the week left unpicked
+    const days = weekDays(weekMon);
+    const thisMon = weekStart(toYMD(new Date()));
+    const weekLabel = `${dayLabel(days[0])} to ${dayLabel(days[6])}`;
+    const savedDates = [...new Set(weeklyReports.map(r => r.shift_date))];
+    const savedInWeek = savedDates.filter(d => days.includes(d)).sort();
+    const selDates = new Set(selReports.map(r => r.shift_date));
+    const extraSel = [...selDates].filter(d => !days.includes(d)).sort();
+    const notSel = savedInWeek.filter(d => !selDates.has(d));
+    const differs = selReports.length > 0 && (extraSel.length > 0 || notSel.length > 0);
+    const wbtn = (active, color) => ({ ...btn(active, color), height:32, display:"inline-flex", alignItems:"center", justifyContent:"center" });
+    const warn = { background:"#3b2500", border:"1px solid #9a3412", color:"#fb923c",
+      padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10, lineHeight:1.5 };
+    const th = { padding:"7px 10px", textAlign:"left", fontSize:10, color:"#4b5e7a", textTransform:"uppercase",
+      letterSpacing:0.8, fontWeight:600, whiteSpace:"nowrap", position:"sticky", top:0, background:"#060d16" };
+    const cell = { padding:"6px 10px", fontSize:12, whiteSpace:"nowrap", fontFamily:"'DM Mono',monospace" };
 
     return (
       <div style={{ minHeight:"100vh", background:"#060d16", color:"#c8d6e8",
         fontFamily:"'DM Sans','Segoe UI',sans-serif", padding:20 }}>
         {pageHeader}
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 }}>
+
+        {/* 1. Title row */}
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12, flexWrap:"wrap", gap:8 }}>
           <div>
             <div style={{ fontSize:16, fontWeight:700, color:"#e2e8f0" }}>WEEKLY ROLLUP</div>
             <div style={{ fontSize:11, color:"#4b5e7a", marginTop:2 }}>
-              Pick the saved days to include, then build the rollup
+              Pick a week, or saved days by hand, then build. Tap a name for every swipe and how the week was calculated.
             </div>
           </div>
-          <button onClick={() => setScreen(results.length ? "results" : "upload")} style={btn(false, "#334155")}>Back</button>
+          <button onClick={() => setScreen(results.length ? "results" : "upload")} style={wbtn(false, "#334155")}>Back</button>
         </div>
 
+        {/* 2. Week row: the week control, manual picks, then build and export */}
+        <div data-testid="week-row" style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10, alignItems:"center" }}>
+          <button onClick={() => shiftWeek(-1)} disabled={weeklyBusy} aria-label="Previous week" title="Previous week"
+            style={{ ...wbtn(false, "#1d4ed8"), padding:"0 10px" }}>&lsaquo;</button>
+          <button data-testid="week-button" onClick={() => openWeek(weekMon)} disabled={weeklyBusy}
+            title="Builds the rollup for this Monday to Sunday week" style={wbtn(true, "#1d4ed8")}>{weekLabel}</button>
+          <button onClick={() => shiftWeek(1)} disabled={weeklyBusy || weekMon >= thisMon} aria-label="Next week" title="Next week"
+            style={{ ...wbtn(false, "#1d4ed8"), padding:"0 10px", opacity: weekMon >= thisMon ? 0.4 : 1, cursor: weekMon >= thisMon ? "default" : "pointer" }}>&rsaquo;</button>
+          <button onClick={selectAll} style={wbtn(false, "#1d4ed8")}
+            title="Every saved day in the list (the newest copy of a day saved twice)">Select All</button>
+          {selIds.size > 0 && (
+            <button onClick={() => { setSelIds(new Set()); setRollup(null); }} style={wbtn(false, "#334155")}>Clear</button>
+          )}
+          <span data-testid="sel-count" style={{ fontSize:11, color:"#4b5e7a", fontFamily:"'DM Mono',monospace" }}>
+            {selIds.size} day(s) selected
+          </span>
+          <span style={{ flex:"1 1 auto" }} />
+          <button
+            onClick={buildRollup}
+            disabled={weeklyBusy || !selIds.size}
+            style={{ ...wbtn(true, "#1d4ed8"), background: weeklyBusy || !selIds.size ? "#1a2d45" : "#1d4ed8",
+              borderColor: weeklyBusy || !selIds.size ? "#1a2d45" : "#1d4ed8",
+              cursor: weeklyBusy || !selIds.size ? "default" : "pointer" }}
+          >{weeklyBusy ? "Building" : "Build Rollup"}</button>
+          {rollup && (
+            <button
+              onClick={() => exportWeeklyXLSX({ ...rollup, emps: rollEmps }, rollupMeta, rules, { rows: weeklyAreaRows, basis: areaBasis }, rosterInfo)}
+              style={{ ...wbtn(true, "#0e7490"), background:"#0e7490", borderColor:"#0e7490", color:"#fff" }}
+            >Excel</button>
+          )}
+        </div>
+        {weeklyNote && (
+          <div data-testid="weekly-note" style={{ fontSize:11, color:"#6b7a8d", marginBottom:10, lineHeight:1.5 }}>{weeklyNote}</div>
+        )}
+
+        {/* 3. Warnings, only when needed */}
         {weeklyMsg && (
           <div style={{ background:"#3f1d1d", border:"1px solid #7f1d1d", color:"#e2e8f0",
             padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10 }}>{weeklyMsg}</div>
         )}
-        {weeklyNote && (
-          <div data-testid="weekly-note" style={{ background:"#0d1520", border:"1px solid #1a2d45", color:"#c8d6e8",
-            padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10, lineHeight:1.5 }}>{weeklyNote}</div>
-        )}
-
-        {/* Day picker */}
-        <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10, alignItems:"center" }}>
-          <button onClick={() => selectWeek(0)}  style={btn(false, "#1d4ed8")}>This Week</button>
-          <button onClick={() => selectWeek(-1)} style={btn(false, "#1d4ed8")}>Last Week</button>
-          <button onClick={selectAll} style={btn(false, "#1d4ed8")}
-            title="Every saved day in the list (the newest copy of a day saved twice)">Select All</button>
-          {selIds.size > 0 && (
-            <button onClick={() => { setSelIds(new Set()); setRollup(null); setWeeklyNote(""); }} style={btn(false, "#334155")}>Clear</button>
-          )}
-          <span style={{ fontSize:11, color:"#4b5e7a", fontFamily:"'DM Mono',monospace" }}>
-            {selIds.size} day(s) selected
-          </span>
-        </div>
-
-        {dupSelected && (
-          <div style={{ background:"#3b2500", border:"1px solid #9a3412", color:"#fb923c",
-            padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10 }}>
-            ⚠ Two reports with the same shift date are selected. The later saved one counts for that day.
-          </div>
-        )}
-        {weekKeys.length > 1 && (
-          <div data-testid="week-span" style={{ background:"#3b2500", border:"1px solid #9a3412", color:"#fb923c",
-            padding:"8px 12px", borderRadius:6, fontSize:12, marginBottom:10, lineHeight:1.5 }}>
-            ⚠ The selected days are in {weekKeys.length} different weeks (Monday to Sunday):{" "}
-            {weekKeys.map(w => `week of ${dayLabel(w)}: ${[...selWeeks[w]].sort().map(dayLabel).join(", ")}`).join("; ")}.
+        {differs && (
+          <div data-testid="week-diff" style={warn}>
+            Selection differs from the week of {weekLabel}.
+            {extraSel.length > 0 && ` Also selected: ${extraSel.map(dayLabel).join(", ")}.`}
+            {notSel.length > 0 && ` Not selected: ${notSel.map(dayLabel).join(", ")}.`}
             {" "}A night shift is dated the day it starts, so Sunday night belongs to the week that ends that Sunday.
           </div>
         )}
+        {dupSelected && (
+          <div data-testid="dup-selected" style={warn}>
+            Two reports with the same shift date are selected. The later saved one counts for that day.
+          </div>
+        )}
 
-        <div style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden", marginBottom:14 }}>
-          {weeklyReports.length === 0 ? (
-            <div style={{ padding:24, color:"#4b5e7a", fontSize:13 }}>
-              No saved daily reports yet. Upload CSVs (drop several at once) and save them first.
+        {/* 4. Saved days: one line when collapsed, a compact table when open */}
+        <div data-testid="saved-days" style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden", marginBottom:14 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8, flexWrap:"wrap", padding:"8px 12px" }}>
+            <div data-testid="saved-days-line" style={{ fontSize:12, color:"#c8d6e8" }}>
+              {countOf(savedDates.length, "saved day", "saved days")}, {savedInWeek.length} in this week
+            </div>
+            <div style={{ display:"flex", gap:6 }}>
+              {panelOpen && weeklyReports.length > 0 && (
+                <button onClick={() => setShowFiles(v => !v)} style={wbtn(showFiles, "#334155")} title="Show the file each day was saved from">File</button>
+              )}
+              <button onClick={() => setPanelOpen(o => !o)} style={wbtn(false, "#334155")}>{panelOpen ? "Hide" : "Show"}</button>
+            </div>
+          </div>
+          {panelOpen && (weeklyReports.length === 0 ? (
+            <div style={{ padding:"0 12px 14px", color:"#4b5e7a", fontSize:13 }}>
+              No saved daily reports yet. Upload the Genetec files (drop several at once) and save them first.
             </div>
           ) : (
-            <div style={{ overflowX:"auto", maxHeight:300, overflowY:"auto" }}>
-              <table style={{ width:"100%", borderCollapse:"collapse", minWidth:680 }}>
+            <div style={{ overflow:"auto", maxHeight:240, borderTop:"1px solid #1a2535" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse" }}>
                 <thead>
                   <tr style={{ background:"#060d16", borderBottom:"2px solid #1a2535" }}>
-                    {["","Shift Date","File","Uploaded By","Workers","Total Hrs"].map((h, i) => (
-                      <th key={i} style={{ padding:"9px 12px", textAlign:"left", fontSize:10,
-                        color:"#4b5e7a", textTransform:"uppercase", letterSpacing:0.8, fontWeight:600,
-                        position:"sticky", top:0, background:"#060d16" }}>{h}</th>
+                    {["", "Day", "Date", "Workers", "Flags", "Hours", "Saved", ...(showFiles ? ["File"] : [])].map((h, i) => (
+                      <th key={i} style={th}>{h}</th>
                     ))}
                   </tr>
                 </thead>
@@ -2046,48 +2453,33 @@ export default function App() {
                   {weeklyReports.map(r => (
                     <tr key={r.id}
                       onClick={() => toggleSel(r.id)}
+                      title={r.file_name || undefined}
                       style={{ borderBottom:"1px solid #1a2535", cursor:"pointer",
                         background: selIds.has(r.id) ? "#0d1e30" : "transparent" }}>
-                      <td style={{ padding:"9px 12px" }}>
+                      <td style={{ padding:"6px 10px" }}>
                         <input type="checkbox" readOnly checked={selIds.has(r.id)} style={{ cursor:"pointer" }} />
                       </td>
-                      <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace", whiteSpace:"nowrap" }}>
-                        <span style={{ color: weekdayOf(r.shift_date) === "Sun" ? "#fbbf24" : "#6b7a8d", marginRight:6 }}>{weekdayOf(r.shift_date)}</span>
-                        {r.shift_date}
+                      <td style={cell}>
+                        <span style={{ color: weekdayOf(r.shift_date) === "Sun" ? "#fbbf24" : "#6b7a8d" }}>{weekdayOf(r.shift_date)}</span>
                       </td>
-                      <td style={{ padding:"9px 12px", fontSize:11, fontFamily:"'DM Mono',monospace",
-                        color:"#6b7a8d", wordBreak:"break-all" }}>{r.file_name || ""}</td>
-                      <td style={{ padding:"9px 12px", fontSize:12 }}>{r.uploaded_by}</td>
-                      <td style={{ padding:"9px 12px", fontSize:12 }}>{r.total_workers}</td>
-                      <td style={{ padding:"9px 12px", fontSize:12, fontFamily:"'DM Mono',monospace" }}>
-                        {decToHM(Number(r.total_bill_hrs) || 0)}
-                      </td>
+                      <td style={cell}>{r.shift_date}</td>
+                      <td style={cell}>{r.total_workers}</td>
+                      <td style={{ ...cell, color: savedFlags(r) > 0 ? "#f87171" : "#c8d6e8" }}>{savedFlags(r)}</td>
+                      <td style={cell}>{decToHM(Number(r.total_bill_hrs) || 0)}</td>
+                      <td style={{ ...cell, color:"#6b7a8d" }} title={`Saved ${savedWhen(r)} by ${r.uploaded_by}`}>{savedWhen(r)}</td>
+                      {showFiles && (
+                        <td style={{ ...cell, color:"#6b7a8d", fontSize:11, maxWidth:260, overflow:"hidden", textOverflow:"ellipsis" }}
+                          title={r.file_name || undefined}>{r.file_name || ""}</td>
+                      )}
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-          )}
+          ))}
         </div>
 
-        <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:16 }}>
-          <button
-            onClick={buildRollup}
-            disabled={weeklyBusy || !selIds.size}
-            style={{
-              background: weeklyBusy || !selIds.size ? "#1a2d45" : "#1d4ed8", color:"#fff", border:"none",
-              borderRadius:6, padding:"10px 18px", fontSize:13, fontWeight:600,
-              cursor: weeklyBusy || !selIds.size ? "default" : "pointer", fontFamily:"'DM Mono',monospace",
-            }}
-          >{weeklyBusy ? "Building…" : "Build Rollup"}</button>
-          {rollup && (
-            <button
-              onClick={() => exportWeeklyXLSX({ ...rollup, emps: rollEmps }, rollupMeta, rules, { rows: weeklyAreaRows, basis: areaBasis }, rosterInfo)}
-              style={{ ...btn(true, "#1d4ed8"), background:"#0e7490", borderColor:"#0e7490", color:"#fff" }}
-            >↓ Excel</button>
-          )}
-        </div>
-
+        {/* 5. The rollup */}
         {rollup && (<>
           <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
             <StatCard label="Employees"   value={rollup.emps.length}    color="#3b82f6" />
@@ -2114,7 +2506,7 @@ export default function App() {
 
           <div style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden" }}>
             <div style={{ overflowX:"auto", WebkitOverflowScrolling:"touch" }}>
-              <table style={{ width:"100%", borderCollapse:"collapse", minWidth:680 }}>
+              <table data-testid="rollup-table" style={{ width:"100%", borderCollapse:"collapse", minWidth:680 }}>
                 <thead>
                   <tr style={{ background:"#060d16", borderBottom:"2px solid #1a2535" }}>
                     {["Employee Name","Company","EIN", ...(showRosterCols ? ["Supervisor","Area", ...(hasScope ? ["Scope"] : [])] : []),
@@ -2127,34 +2519,8 @@ export default function App() {
                 </thead>
                 <tbody>
                   {shownEmps.map((e, i) => (
-                    <tr key={i} style={{ borderBottom:"1px solid #1a2535",
-                      background: i % 2 === 0 ? "#0d1520" : "#0a1118" }}>
-                      <td style={{ ...td, whiteSpace:"nowrap" }}>{e.name}</td>
-                      <td style={{ ...td, color:"#6b7a8d" }}>{e.company}</td>
-                      <td style={{ ...td, color:"#6b7a8d", fontFamily:"'DM Mono',monospace" }}>{e.ein}</td>
-                      {showRosterCols && (<>
-                        <td style={{ ...td, fontSize:12, whiteSpace:"nowrap" }}>{e.notInRoster || e.supervisor === "N/A" ? "" : e.supervisor}</td>
-                        <td style={{ ...td, fontSize:12, color: e.notInRoster ? "#f59e0b" : "#c8d6e8", whiteSpace:"nowrap" }}>
-                          {e.notInRoster ? "Not in roster" : e.area === "N/A" ? "" : e.area}</td>
-                        {hasScope && <td style={{ ...td, fontSize:12 }}>{e.notInRoster || e.scope === "N/A" ? "" : e.scope}</td>}
-                      </>)}
-                      {rollup.dates.map(d => {
-                        const day = e.days[d];
-                        const review = day && day.billHrs == null && (day.status === "Late IN" || day.status === "Late OUT");
-                        return (
-                          <td key={d} title={day && day.note ? day.note : undefined} style={{ ...td, fontFamily:"'DM Mono',monospace", fontSize:12,
-                            whiteSpace:"nowrap",
-                            color: !day ? "#374151" : review ? "#facc15" : day.billHrs == null && day.status !== "Clean" ? "#ef4444"
-                              : day.over13 ? "#fb923c" : day.status === "Split Shift" ? "#facc15" : "#c8d6e8" }}>
-                            {dayCell(day)}
-                          </td>
-                        );
-                      })}
-                      <td style={{ ...td, fontFamily:"'DM Mono',monospace" }}>{e.daysWorked}</td>
-                      <td style={{ ...td, fontFamily:"'DM Mono',monospace", fontWeight:700, color:"#e2e8f0" }}>
-                        {decToHM(e.total)}
-                      </td>
-                    </tr>
+                    <WeekRow key={e.guid || `${e.ein}|${e.name}`} e={e} idx={i} dates={rollup.dates} dayInfo={rollup.dayInfo || {}}
+                      showRoster={showRosterCols} showScope={hasScope} fmtD={fmtD} loadSwipes={loadSwipes} />
                   ))}
                   {!shownEmps.length && (
                     <tr><td colSpan={5 + rollup.dates.length + (showRosterCols ? (hasScope ? 3 : 2) : 0)} style={{ padding:36, textAlign:"center", color:"#4b5e7a" }}>
@@ -2188,7 +2554,7 @@ export default function App() {
         <div style={{ background:"#0a1320", border:"1px solid #1a2535", borderRadius:10, overflow:"hidden" }}>
           {!roster.length ? (
             <div style={{ padding:24, color:"#4b5e7a", fontSize:13 }}>
-              No employee roster uploaded yet. Open ⚙ Config to upload one.
+              No employee roster uploaded yet. Open Config to upload one.
             </div>
           ) : !absentEmployees.length ? (
             <div style={{ padding:24, color:"#34d399", fontSize:13 }}>
@@ -2617,7 +2983,7 @@ export default function App() {
         {screen === "results" && (<>
 
           {saveMsg && (() => {
-            const bad = /error|not removed|^Nothing|^Enter|^Database/i.test(saveMsg);
+            const bad = /error|not removed|could not be stored|^Nothing|^Enter|^Database/i.test(saveMsg);
             return (
               <div data-testid="save-msg" style={{
                 background: bad ? "#3f1d1d" : "#14532d",
@@ -2767,7 +3133,11 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((r, i) => <Row key={r.guid} r={r} idx={i} showRoster={roster.length > 0} showScope={hasScope} />)}
+                  {filtered.map((r, i) => (
+                    <Row key={r.guid} r={r} idx={i} showRoster={roster.length > 0} showScope={hasScope} shiftDate={shiftDate}
+                      swipes={swipesByGuid ? (swipesByGuid.get(r.guid) || []) : undefined}
+                      loadSwipes={!swipesByGuid && loadedReportId ? loadDaySwipes : null} />
+                  ))}
                   {!filtered.length && (
                     <tr><td colSpan={7 + (roster.length > 0 ? (hasScope ? 3 : 2) : 0)} style={{ padding:36, textAlign:"center", color:"#4b5e7a" }}>
                       No records match.
